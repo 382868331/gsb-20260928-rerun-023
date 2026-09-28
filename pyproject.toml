@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "texturegraph"
+version = "0.1.0"
+description = "Deterministic cached texture-node graph engine"
+requires-python = ">=3.11"
+dependencies = ["numpy", "pillow"]
+
+[project.scripts]
+texturegraph = "texturegraph.cli:main"
+
+[tool.setuptools]
+packages = ["texturegraph"]
