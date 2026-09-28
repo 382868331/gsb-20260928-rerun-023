@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "materialgraph"
+version = "0.1.0"
+description = "Cached node-based texture computation system"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24", "Pillow>=9.0"]
+
+[project.scripts]
+materialgraph = "materialgraph.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["materialgraph*"]
