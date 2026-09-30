@@ -101,6 +101,137 @@ def test_shared_mask_in_one_frame_is_evaluated_once_for_both_outputs(tmp_path):
     assert context.evaluated.count("shared_mask") == 1
     assert context.evaluated.count("circle_transform") == 1
 
+
+def test_resume_recomputes_changed_branch_and_reuses_unaffected_output(tmp_path):
+    graph, _ = build_graph()
+    frames = [
+        FrameRequest(
+            0.0,
+            (
+                FrameOutput("branch_a", str(tmp_path / "a.png"), 32, 32),
+                FrameOutput("branch_b", str(tmp_path / "b.png"), 32, 32),
+            ),
+        )
+    ]
+    TextureEngine(graph, EvaluationCache()).render_frames(frames, resume=False)
+    original_b = (tmp_path / "b.png").read_bytes()
+
+    graph.set_param("red", "color", [0.1, 0.9, 0.2, 1.0])
+    results = TextureEngine(graph, EvaluationCache()).render_frames(frames)
+
+    result = results[0]
+    assert list(result.recomputed) == [str(tmp_path / "a.png")]
+    assert list(result.reused) == [str(tmp_path / "b.png")]
+    assert "上游依赖签名不匹配" in result.reasons[str(tmp_path / "a.png")]
+    assert "像素指纹均匹配" in result.reasons[str(tmp_path / "b.png")]
+    assert (tmp_path / "b.png").read_bytes() == original_b
+    assert (tmp_path / "a.png").read_bytes() != original_b
+
+
+def test_resume_recomputes_only_outputs_using_changed_shared_input(tmp_path):
+    graph, _ = build_graph()
+    frames = [
+        FrameRequest(
+            0.0,
+            (
+                FrameOutput("branch_a", str(tmp_path / "a.png"), 32, 32),
+                FrameOutput("branch_b", str(tmp_path / "b.png"), 32, 32),
+            ),
+        )
+    ]
+    TextureEngine(graph, EvaluationCache()).render_frames(frames, resume=False)
+
+    graph.set_param("shared_mask", "radius", 0.2)
+    result = TextureEngine(graph, EvaluationCache()).render_frames(frames)[0]
+
+    assert set(result.recomputed) == {
+        str(tmp_path / "a.png"),
+        str(tmp_path / "b.png"),
+    }
+    assert all("上游依赖签名不匹配" in reason for reason in result.reasons.values())
+
+
+def test_resume_detects_tampered_pixels_even_when_size_matches(tmp_path):
+    graph, _ = build_graph()
+    output = FrameOutput("branch_a", str(tmp_path / "a.png"), 32, 32)
+    frames = [FrameRequest(0.0, (output,))]
+    TextureEngine(graph, EvaluationCache()).render_frames(frames, resume=False)
+
+    with Image.open(output.path) as image:
+        signature = image.text["texturegraph_node_signature"]
+        digest = image.text["texturegraph_pixel_sha256"]
+        changed = Image.new("RGBA", image.size)
+        changed.paste(image.copy())
+        changed.load()[0, 0] = (0, 255, 0, 255)
+        changed.save(
+            output.path,
+            format="PNG",
+            pnginfo=_png_metadata(signature, digest),
+        )
+
+    result = TextureEngine(graph, EvaluationCache()).render_frames(frames)[0]
+    assert result.skipped is False
+    assert output.path in result.recomputed
+    assert "像素内容指纹不匹配" in result.reasons[output.path]
+
+
+def test_same_filename_and_size_at_same_time_keeps_distinct_content(tmp_path):
+    red_graph, _ = build_graph()
+    green_graph, _ = build_graph()
+    green_graph.set_param("red", "color", [0.1, 0.9, 0.2, 1.0])
+
+    red_path = tmp_path / "red" / "branch.png"
+    green_path = tmp_path / "green" / "branch.png"
+    red_request = [
+        FrameRequest(0.0, (FrameOutput("branch_a", str(red_path), 32, 32),))
+    ]
+    green_request = [
+        FrameRequest(0.0, (FrameOutput("branch_a", str(green_path), 32, 32),))
+    ]
+
+    TextureEngine(red_graph, EvaluationCache()).render_frames(
+        red_request, resume=False
+    )
+    TextureEngine(green_graph, EvaluationCache()).render_frames(
+        green_request, resume=False
+    )
+
+    assert red_path.read_bytes() != green_path.read_bytes()
+    assert all(
+        result.skipped
+        for result in TextureEngine(green_graph, EvaluationCache()).render_frames(
+            green_request
+        )
+    )
+
+
+def test_conflicting_outputs_at_same_path_and_time_are_rejected(tmp_path):
+    graph, _ = build_graph()
+    path = str(tmp_path / "branch.png")
+    frame = FrameRequest(
+        0.0,
+        (
+            FrameOutput("branch_a", path, 32, 32),
+            FrameOutput("branch_b", path, 32, 32),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="same path"):
+        TextureEngine(graph, EvaluationCache()).render_frames(
+            [frame], resume=False
+        )
+
+
+def _png_metadata(signature: str, digest: str):
+    from PIL.PngImagePlugin import PngInfo
+
+    metadata = PngInfo()
+    metadata.add_text("texturegraph_node_signature", signature)
+    metadata.add_text("texturegraph_node_id", "branch_a")
+    metadata.add_text("texturegraph_pixel_sha256", digest)
+    return metadata
+
+
 def test_same_frame_at_different_resolutions_never_share_values():
     graph, _ = build_graph()
     cache = EvaluationCache()

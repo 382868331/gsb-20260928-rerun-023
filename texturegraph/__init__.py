@@ -12,7 +12,13 @@ from .engine import (
 )
 from .errors import CycleError, GraphValidationError, RenderCancelled
 from .graph import Connection, Graph, Node
-from .project import RenderJob, load_project, render_project, save_project
+from .project import (
+    RenderJob,
+    load_project,
+    render_project,
+    render_project_report,
+    save_project,
+)
 
 __all__ = [
     "CACHE_VERSION",
@@ -33,5 +39,6 @@ __all__ = [
     "TextureEngine",
     "load_project",
     "render_project",
+    "render_project_report",
     "save_project",
 ]

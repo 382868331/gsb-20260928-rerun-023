@@ -197,12 +197,12 @@ def load_project(path: str) -> tuple[Graph, dict[str, str], dict]:
     return graph, outputs, data
 
 
-def render_project(
+def render_project_report(
     project_path: str,
     is_cancelled: Callable[[], bool] = lambda: False,
     cache: EvaluationCache | None = None,
     resume: bool = True,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], list]:
     project_path = str(Path(project_path))
     project_directory = os.path.dirname(os.path.abspath(project_path))
     graph, outputs, data = load_project(project_path)
@@ -235,6 +235,11 @@ def render_project(
                 frames_by_time[time] = {}
                 order.append(time)
             for output in request.outputs:
+                existing = frames_by_time[time].get(output.path)
+                if existing is not None and existing != output:
+                    raise ValueError(
+                        f"jobs at time {time} both publish different outputs to {output.path}"
+                    )
                 frames_by_time[time][output.path] = output
 
     frames = [
@@ -245,6 +250,21 @@ def render_project(
     rendered: dict[str, str] = {}
     for result in results:
         rendered.update(result.outputs)
+    return rendered, results
+
+
+def render_project(
+    project_path: str,
+    is_cancelled: Callable[[], bool] = lambda: False,
+    cache: EvaluationCache | None = None,
+    resume: bool = True,
+) -> dict[str, str]:
+    rendered, _ = render_project_report(
+        project_path,
+        is_cancelled=is_cancelled,
+        cache=cache,
+        resume=resume,
+    )
     return rendered
 
 

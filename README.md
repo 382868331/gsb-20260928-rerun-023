@@ -13,8 +13,9 @@ Python 底层的确定性材质节点图。节点图把颜色、二维坐标变�
   - 同一帧同一分辨率的多个输出共享遮罩，只计算一次；
   - 修改某时间段或某条支线上的参数，只重算相关帧和下游分支。
 - 同一工程可声明三类渲染任务（RenderJob）：静态预览（static）、连续帧（sequence）和高分辨率静帧。
-- 帧批次逐帧计算、逐帧原子发布；取消后未提交的帧不留下半成品，已发布的结果保持不变。
-- 支持取消后续跑（resume）：已存在且分辨率正确的帧自动跳过，错误尺寸的 PNG 会被识别并重渲染，不跳帧、不混用尺寸。
+- 帧批次先完成计算，再逐张原子发布；取消后未提交的 PNG 不会被当作结果，已发布的版本保持不变。
+- 支持取消后续跑（resume）：PNG 内嵌输出节点、当前完整依赖签名和像素指纹；只有尺寸、节点身份、输入参数、动画时间、上游依赖和像素内容全部匹配才复用。
+- 多材质共享输入时，帧内共享节点只计算一次；局部参数变化只重做签名失效的输出，`FrameResult.reused`、`FrameResult.recomputed` 和 `FrameResult.reasons` 会说明依据。
 - 工程保存为确定性 JSON（版本 2，含 tracks 和 jobs）；版本 1 工程仍可读取渲染。
 
 ## 运行示例
@@ -30,6 +31,8 @@ Python 底层的确定性材质节点图。节点图把颜色、二维坐标变�
 也可以渲染已有工程：
 
     python -m texturegraph.cli path/to/project.json
+
+CLI 对每张图输出“复用”或“重算”，并显示尺寸、节点依赖签名、像素指纹或缺失等判定原因。
 
 ## 编程用法
 
@@ -56,7 +59,7 @@ frames = [
     FrameRequest(0.5, (FrameOutput('branch_a', 'out/a-hires.png', 512, 512),)),
 ]
 engine.render_frames(frames, is_cancelled=lambda: cancelled)
-# 取消后再次调用即可续跑，已完成且尺寸正确的帧会被跳过。
+# 取消后再次调用即可续跑；只有与当前输入、参数、时间和依赖完全一致的文件会被跳过。
 engine.render_frames(frames, is_cancelled=lambda: cancelled)
 ```
 

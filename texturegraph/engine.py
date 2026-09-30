@@ -4,10 +4,12 @@ import copy
 import hashlib
 import json
 from dataclasses import dataclass
+from dataclasses import field
 from typing import Callable
 
 import numpy as np
 from PIL import Image as PilImage
+from PIL.PngImagePlugin import PngInfo
 
 from .errors import GraphValidationError, RenderCancelled
 from .graph import Graph
@@ -15,7 +17,10 @@ from .nodes import NODE_TYPES, NodeType
 
 # Bump when node execution semantics or the signature payload change so old
 # cached masks/frames can never be mistaken for current results.
-CACHE_VERSION = 2
+CACHE_VERSION = 3
+SIGNATURE_TEXT_KEY = "texturegraph_node_signature"
+NODE_ID_TEXT_KEY = "texturegraph_node_id"
+PIXEL_DIGEST_TEXT_KEY = "texturegraph_pixel_sha256"
 
 
 @dataclass(frozen=True)
@@ -44,6 +49,9 @@ class FrameRequest:
 class FrameResult:
     time: float
     outputs: dict[str, str]
+    reused: dict[str, str] = field(default_factory=dict)
+    recomputed: dict[str, str] = field(default_factory=dict)
+    reasons: dict[str, str] = field(default_factory=dict)
     skipped: bool = False
 
 
@@ -181,34 +189,56 @@ class TextureEngine:
     ) -> list[FrameResult]:
         """Render and atomically publish frames.
 
-        Each frame is an independent publish: outputs committed by earlier
-        frames are never overwritten or removed.  With resume enabled (the
-        default), frames whose PNGs already exist at the requested node and
-        resolution are skipped, so a cancelled batch can continue without
-        repeating or dropping frames and without mixing resolutions.
+        Each output is atomically published after the whole frame is evaluated.
+        With resume enabled, a PNG is reused only when its node identity,
+        dimensions, complete dependency signature and pixel digest match the
+        current request; temporary files and stale published results are never
+        treated as completed work.
         """
 
         results: list[FrameResult] = []
         for frame in frames:
+            validate_frame_outputs(frame)
             context = RenderContext(is_cancelled=is_cancelled, time=frame.time)
-            existing = {
-                output.node_id: output.path
-                for output in frame.outputs
-                if resume and published_png_is_valid(output)
-            }
-            pending = [
-                output for output in frame.outputs if output.node_id not in existing
-            ]
+            planned: list[tuple[FrameOutput, str, str]] = []
+            existing: dict[str, str] = {}
+            reasons: dict[str, str] = {}
+            for output in frame.outputs:
+                signature = self.output_signature(
+                    output.node_id,
+                    output.width,
+                    output.height,
+                    frame.time,
+                )
+                if not resume:
+                    reason = "resume=False，按当前请求强制重算"
+                else:
+                    valid, published_reason = published_png_status(output, signature)
+                    reason = published_reason
+                    reasons[output.path] = reason
+                    if valid:
+                        existing[output.path] = output.path
+                        continue
+                planned.append((output, signature, reason))
+            pending = [output for output, _, _ in planned]
             if not pending:
-                results.append(FrameResult(frame.time, existing, skipped=True))
+                results.append(
+                    FrameResult(
+                        frame.time,
+                        existing,
+                        reused=dict(existing),
+                        reasons=reasons,
+                        skipped=True,
+                    )
+                )
                 continue
 
             # Share values across outputs of THIS frame (same time and same
             # output resolution) so a shared mask is computed only once, while
             # distinct resolutions still get distinct signatures.
             scope: dict[str, object] = {}
-            rendered: list[tuple[FrameOutput, object]] = []
-            for output in pending:
+            rendered: list[tuple[FrameOutput, str, object]] = []
+            for output, signature, _ in planned:
                 value = self.evaluate(
                     output.node_id,
                     context,
@@ -217,17 +247,38 @@ class TextureEngine:
                     frame.time,
                     scope,
                 )
-                rendered.append((output, value))
-            for output, value in rendered:
-                write_png_atomic(value, output.path)
-                existing[output.node_id] = output.path
+                rendered.append((output, signature, value))
+            for output, signature, value in rendered:
+                context.raise_if_cancelled()
+                write_png_atomic(value, output, signature)
+                existing[output.path] = output.path
+            reused_paths = {
+                path
+                for path in existing
+                if path not in {output.path for output in pending}
+            }
             results.append(
                 FrameResult(
                     frame.time,
-                    {output.node_id: output.path for output in frame.outputs},
+                    {output.path: output.path for output in frame.outputs},
+                    reused={
+                        path: path
+                        for path in existing
+                        if path in reused_paths
+                    },
+                    recomputed={
+                        output.path: output.path for output in pending
+                    },
+                    reasons=reasons,
                 )
             )
         return results
+
+    def output_signature(
+        self, output_node: str, width: int, height: int, time: float
+    ) -> str:
+        order = self.graph.topological_order(output_node)
+        return self._signatures(order, width, height, time)[output_node]
 
     def _prepare_inputs(self, node_id: str, node_type: NodeType, values):
         incoming = self.graph.inputs_for(node_id)
@@ -292,6 +343,7 @@ class TextureEngine:
                 input_signatures[port_name] = result[connection.source_node]
             payload = {
                 "cache_version": CACHE_VERSION,
+                "node_id": node_id,
                 "size": [width, height],
                 "type": node.type,
                 "output_type": node_type.output_type,
@@ -333,29 +385,65 @@ def to_pil_image(value) -> PilImage.Image:
     return PilImage.fromarray(channels, mode="RGBA")
 
 
-def published_png_is_valid(output: FrameOutput) -> bool:
-    """A published file counts only at the requested resolution."""
+def validate_frame_outputs(frame: FrameRequest) -> None:
+    by_path: dict[str, FrameOutput] = {}
+    for output in frame.outputs:
+        existing = by_path.get(output.path)
+        if existing is not None and existing != output:
+            raise ValueError(
+                f"multiple outputs at time {frame.time} claim the same path: {output.path}"
+            )
+        by_path[output.path] = output
+
+
+def published_png_status(
+    output: FrameOutput, expected_signature: str
+) -> tuple[bool, str]:
+    """Validate a published artifact against the full current request."""
     import os
 
     if not os.path.exists(output.path):
-        return False
+        return False, "未找到已发布文件，需要重算"
     try:
         with PilImage.open(output.path) as image:
             image.load()
-            return tuple(image.size) == (output.width, output.height)
+            if tuple(image.size) != (output.width, output.height):
+                return False, "已发布文件尺寸与当前请求不同，需要重算"
+            if image.mode != "RGBA":
+                return False, "已发布文件不是 RGBA PNG，需要重算"
+            if image.text.get(NODE_ID_TEXT_KEY) != output.node_id:
+                return False, "已发布文件属于同名或同路径的其他任务，需要重算"
+            signature = image.text.get(SIGNATURE_TEXT_KEY)
+            if signature != expected_signature:
+                return False, "参数、时间、尺寸或上游依赖签名不匹配，需要重算"
+            pixel_digest = pixel_digest_for(image)
+            recorded_digest = image.text.get(PIXEL_DIGEST_TEXT_KEY)
+            if recorded_digest != pixel_digest:
+                return False, "像素内容指纹不匹配，需要重算"
+            return True, "尺寸、当前节点依赖签名和像素指纹均匹配"
     except Exception:
-        return False
+        return False, "已发布文件无法读取或元数据不完整，需要重算"
 
 
-def write_png_atomic(value, path: str) -> None:
+def write_png_atomic(value, output: FrameOutput, signature: str) -> None:
     import os
+    path = output.path
 
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok=True)
     temporary_path = f"{path}.tmp-{os.getpid()}"
     try:
         image = to_pil_image(value)
-        image.save(temporary_path, format="PNG", compress_level=6)
+        metadata = PngInfo()
+        metadata.add_text(SIGNATURE_TEXT_KEY, signature)
+        metadata.add_text(NODE_ID_TEXT_KEY, output.node_id)
+        metadata.add_text(PIXEL_DIGEST_TEXT_KEY, pixel_digest_for(image))
+        image.save(
+            temporary_path,
+            format="PNG",
+            compress_level=6,
+            pnginfo=metadata,
+        )
         os.replace(temporary_path, path)
     except BaseException:
         try:
@@ -363,3 +451,7 @@ def write_png_atomic(value, path: str) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def pixel_digest_for(image: PilImage.Image) -> str:
+    return hashlib.sha256(image.tobytes()).hexdigest()
