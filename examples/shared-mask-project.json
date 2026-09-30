@@ -49,7 +49,58 @@
       "target_port": "mask"
     }
   ],
-  "height": 256,
+  "height": 64,
+  "jobs": [
+    {
+      "height": 512,
+      "id": "hires_a",
+      "kind": "static",
+      "node": "branch_a",
+      "path": "outputs/hires/branch_a.png",
+      "time": 0.5,
+      "width": 512
+    },
+    {
+      "height": 64,
+      "id": "preview_a",
+      "kind": "static",
+      "node": "branch_a",
+      "path": "outputs/preview/branch_a.png",
+      "time": 0.0,
+      "width": 64
+    },
+    {
+      "height": 64,
+      "id": "preview_b",
+      "kind": "static",
+      "node": "branch_b",
+      "path": "outputs/preview/branch_b.png",
+      "time": 0.0,
+      "width": 64
+    },
+    {
+      "end_time": 1.0,
+      "frame_count": 5,
+      "height": 64,
+      "id": "sequence_a",
+      "kind": "sequence",
+      "node": "branch_a",
+      "path": "outputs/frames/branch_a.png",
+      "start_time": 0.0,
+      "width": 64
+    },
+    {
+      "end_time": 1.0,
+      "frame_count": 5,
+      "height": 64,
+      "id": "sequence_b",
+      "kind": "sequence",
+      "node": "branch_b",
+      "path": "outputs/frames/branch_b.png",
+      "start_time": 0.0,
+      "width": 64
+    }
+  ],
   "nodes": [
     {
       "id": "branch_a",
@@ -64,6 +115,7 @@
     {
       "id": "circle_transform",
       "params": {
+        "offset_x": -0.5,
         "rotation_degrees": 20,
         "scale_x": 1.25,
         "scale_y": 0.75
@@ -136,6 +188,23 @@
     "branch_a": "outputs/red-circle.png",
     "branch_b": "outputs/gold-circle.png"
   },
-  "version": 1,
-  "width": 256
+  "tracks": [
+    {
+      "interpolation": "linear",
+      "keyframes": [
+        {
+          "time": 0.0,
+          "value": -0.5
+        },
+        {
+          "time": 1.0,
+          "value": 0.5
+        }
+      ],
+      "node": "circle_transform",
+      "param": "offset_x"
+    }
+  ],
+  "version": 2,
+  "width": 64
 }

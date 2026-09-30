@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+from .animation import ParameterTrack
 from .errors import CycleError, GraphValidationError
 
 
@@ -26,6 +27,7 @@ class Graph:
     height: int = 256
     nodes: dict[str, Node] = field(default_factory=dict)
     connections: list[Connection] = field(default_factory=list)
+    tracks: dict[tuple[str, str], ParameterTrack] = field(default_factory=dict)
 
     def add_node(
         self,
@@ -53,6 +55,19 @@ class Graph:
     def set_param(self, node_id: str, name: str, value: Any) -> None:
         node = self.nodes[node_id]
         node.params[name] = value
+
+    def add_track(self, track: ParameterTrack) -> None:
+        if track.node_id not in self.nodes:
+            raise GraphValidationError(f"unknown node for track: {track.node_id}")
+        self.tracks[(track.node_id, track.param_name)] = track
+
+    def params_at(self, node_id: str, time: float) -> dict[str, Any]:
+        """Static params overlaid with animated values at time."""
+        params = dict(self.nodes[node_id].params)
+        for (track_node, param_name), track in self.tracks.items():
+            if track_node == node_id:
+                params[param_name] = track.value_at(time)
+        return params
 
     def inputs_for(self, node_id: str) -> dict[str, Connection]:
         result: dict[str, Connection] = {}
