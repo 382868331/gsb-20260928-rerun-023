@@ -13,6 +13,17 @@ from .errors import GraphValidationError, RenderCancelled
 from .graph import Graph
 from .nodes import NODE_TYPES, NodeType
 
+CACHE_VERSION = 2
+
+
+@dataclass(frozen=True)
+class RenderTarget:
+    output_node: str
+    path: str
+    frame: int = 0
+    width: int | None = None
+    height: int | None = None
+
 
 @dataclass
 class RenderContext:
@@ -27,19 +38,13 @@ class RenderContext:
 
 class EvaluationCache:
     def __init__(self) -> None:
-        self._signatures: dict[str, str] = {}
         self._values: dict[str, object] = {}
 
-    def get(self, node_id: str, signature: str) -> object | None:
-        if self._signatures.get(node_id) == signature:
-            return self._values[node_id]
-        self._signatures.pop(node_id, None)
-        self._values.pop(node_id, None)
-        return None
+    def get(self, signature: str) -> object | None:
+        return self._values.get(signature)
 
-    def store(self, node_id: str, signature: str, value: object) -> None:
-        self._signatures[node_id] = signature
-        self._values[node_id] = value
+    def store(self, signature: str, value: object) -> None:
+        self._values[signature] = value
 
 
 class TextureEngine:
@@ -52,16 +57,27 @@ class TextureEngine:
         value = self.evaluate(output_node, context)
         return to_pil_image(value)
 
-    def evaluate(self, output_node: str, context: RenderContext | None = None):
+    def evaluate(
+        self,
+        output_node: str,
+        context: RenderContext | None = None,
+        frame: int = 0,
+        width: int | None = None,
+        height: int | None = None,
+    ):
         context = context or RenderContext()
+        width = int(width or self.graph.width)
+        height = int(height or self.graph.height)
+        if width <= 0 or height <= 0:
+            raise GraphValidationError("render width and height must be positive")
         order = self.graph.topological_order(output_node)
-        signatures = self._signatures(order)
+        signatures = self._signatures(order, frame, width, height)
         values: dict[str, object] = {}
 
         for node_id in order:
             context.raise_if_cancelled()
             signature = signatures[node_id]
-            cached = self.cache.get(node_id, signature)
+            cached = self.cache.get(signature)
             if cached is not None:
                 values[node_id] = copy.deepcopy(cached)
                 context.cache_hits.append(node_id)
@@ -73,42 +89,55 @@ class TextureEngine:
             value = np.asarray(
                 node_type.execute(
                     inputs,
-                    node.params,
-                    self.graph.width,
-                    self.graph.height,
+                    self.graph.params_at(node_id, frame),
+                    width,
+                    height,
                 ),
                 dtype=np.float32,
             )
             expected_shape = expected_output_shape(
                 node_type.output_type,
-                self.graph.width,
-                self.graph.height,
+                width,
+                height,
             )
             if tuple(value.shape) != expected_shape:
                 raise GraphValidationError(
                     f"node '{node_id}' returned shape {tuple(value.shape)}, expected {expected_shape}"
                 )
             values[node_id] = value
-            self.cache.store(node_id, signature, value.copy())
+            self.cache.store(signature, value.copy())
             context.evaluated.append(node_id)
 
         return values[output_node]
 
     def render_batch(
         self,
-        output_nodes: list[str],
-        paths: dict[str, str],
+        output_nodes: list[str] | list[RenderTarget],
+        paths: dict[str, str] | None = None,
         is_cancelled: Callable[[], bool] = lambda: False,
     ) -> None:
-        if set(output_nodes) != set(paths):
-            raise ValueError("every output node needs exactly one output path")
+        targets = normalize_targets(output_nodes, paths, self.graph)
+        for target in targets:
+            if target.output_node not in self.graph.nodes:
+                raise GraphValidationError(f"unknown output node: {target.output_node}")
         context = RenderContext(is_cancelled=is_cancelled)
-        rendered: list[tuple[str, object]] = []
-        for output_node in output_nodes:
-            rendered.append((output_node, self.evaluate(output_node, context)))
+        rendered: list[tuple[RenderTarget, object]] = []
+        for target in targets:
+            rendered.append(
+                (
+                    target,
+                    self.evaluate(
+                        target.output_node,
+                        context,
+                        frame=target.frame,
+                        width=target.width,
+                        height=target.height,
+                    ),
+                )
+            )
         context.raise_if_cancelled()
-        for output_node, value in rendered:
-            write_png_atomic(value, paths[output_node])
+        for target, value in rendered:
+            write_png_atomic(value, target.path)
 
     def _prepare_inputs(self, node_id: str, node_type: NodeType, values):
         incoming = self.graph.inputs_for(node_id)
@@ -143,7 +172,13 @@ class TextureEngine:
                 )
         return inputs
 
-    def _signatures(self, order: list[str]) -> dict[str, str]:
+    def _signatures(
+        self,
+        order: list[str],
+        frame: int,
+        width: int,
+        height: int,
+    ) -> dict[str, str]:
         result: dict[str, str] = {}
         for node_id in order:
             node = self.graph.nodes[node_id]
@@ -152,15 +187,33 @@ class TextureEngine:
             for port_name, connection in self.graph.inputs_for(node_id).items():
                 input_signatures[port_name] = result[connection.source_node]
             payload = {
-                "size": [self.graph.width, self.graph.height],
+                "cache_version": CACHE_VERSION,
+                "size": [width, height],
                 "type": node.type,
                 "output_type": node_type.output_type,
-                "params": stable_json(node.params),
+                "params": stable_json(self.graph.params_at(node_id, frame)),
                 "inputs": input_signatures,
             }
             encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
             result[node_id] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
         return result
+
+
+def normalize_targets(
+    output_nodes: list[str] | list[RenderTarget],
+    paths: dict[str, str] | None,
+    graph: Graph,
+) -> list[RenderTarget]:
+    if output_nodes and all(isinstance(item, RenderTarget) for item in output_nodes):
+        if paths is not None:
+            raise ValueError("paths cannot be combined with RenderTarget entries")
+        return list(output_nodes)
+    if paths is None or set(output_nodes) != set(paths):
+        raise ValueError("every output node needs exactly one output path")
+    return [
+        RenderTarget(str(node_id), paths[str(node_id)])
+        for node_id in output_nodes
+    ]
 
 
 def stable_json(value) -> object:

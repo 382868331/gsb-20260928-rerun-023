@@ -9,6 +9,7 @@ from texturegraph import (
     Graph,
     RenderCancelled,
     RenderContext,
+    RenderTarget,
     TextureEngine,
     load_project,
     render_project,
@@ -122,3 +123,138 @@ def test_example_outputs_are_valid_rgba_pictures(tmp_path):
         with Image.open(path) as image:
             assert image.mode == "RGBA"
             assert image.size == (256, 256)
+
+
+def test_animated_mask_is_not_reused_across_frames():
+    graph, _ = build_graph()
+    graph.add_keyframe("shared_mask", "radius", 0, 0.2)
+    graph.add_keyframe("shared_mask", "radius", 1, 0.8)
+    cache = EvaluationCache()
+
+    frame_zero = RenderContext()
+    TextureEngine(graph, cache).evaluate("branch_a", frame_zero, frame=0)
+    frame_one = RenderContext()
+    value_one = TextureEngine(graph, cache).evaluate("branch_a", frame_one, frame=1)
+
+    assert "shared_mask" not in frame_one.cache_hits
+    assert "uv" in frame_one.cache_hits
+    assert "circle_transform" in frame_one.cache_hits
+    assert frame_one.evaluated == ["shared_mask", "branch_a"]
+    assert value_one.shape == (256, 256, 4)
+
+    frame_zero_again = RenderContext()
+    TextureEngine(graph, cache).evaluate("branch_a", frame_zero_again, frame=0)
+    assert frame_zero_again.evaluated == []
+    assert "shared_mask" in frame_zero_again.cache_hits
+
+
+def test_resolution_results_are_cached_separately_and_have_correct_size():
+    graph, _ = build_graph()
+    cache = EvaluationCache()
+    context = RenderContext()
+
+    small = TextureEngine(graph, cache).evaluate(
+        "branch_a", context, width=16, height=8
+    )
+    high = TextureEngine(graph, cache).evaluate(
+        "branch_a", RenderContext(), width=64, height=32
+    )
+    small_again_context = RenderContext()
+    small_again = TextureEngine(graph, cache).evaluate(
+        "branch_a", small_again_context, width=16, height=8
+    )
+
+    assert small.shape == (8, 16, 4)
+    assert high.shape == (32, 64, 4)
+    assert small_again.shape == (8, 16, 4)
+    assert "shared_mask" in small_again_context.cache_hits
+
+
+def test_modifying_one_animated_branch_only_invalidates_that_frame_and_branch():
+    graph, _ = build_graph()
+    graph.add_keyframe("red", "color", 0, [0.2, 0.2, 0.9, 1.0], "step")
+    graph.add_keyframe("red", "color", 2, [0.9, 0.9, 0.1, 1.0], "step")
+    cache = EvaluationCache()
+
+    for frame in (0, 1, 2):
+        TextureEngine(graph, cache).evaluate(
+            "branch_a", RenderContext(), frame=frame
+        )
+        TextureEngine(graph, cache).evaluate(
+            "branch_b", RenderContext(), frame=frame
+        )
+
+    graph.set_param("gold", "color", [0.1, 0.9, 0.8, 1.0])
+    frame_one_b = RenderContext()
+    TextureEngine(graph, cache).evaluate("branch_b", frame_one_b, frame=1)
+    frame_zero_a = RenderContext()
+    TextureEngine(graph, cache).evaluate("branch_a", frame_zero_a, frame=0)
+
+    assert frame_one_b.evaluated == ["gold", "branch_b"]
+    assert frame_zero_a.evaluated == []
+
+
+def test_cancelled_multires_frame_batch_can_resume_without_skipping(tmp_path):
+    graph, _ = build_graph()
+    graph.add_keyframe("circle_transform", "offset_x", 0, -0.5)
+    graph.add_keyframe("circle_transform", "offset_x", 2, 0.5)
+    cache = EvaluationCache()
+
+    targets = [
+        RenderTarget("branch_a", str(tmp_path / "preview.png"), frame=0),
+        RenderTarget("branch_a", str(tmp_path / "f0.png"), frame=0, width=32, height=16),
+        RenderTarget("branch_a", str(tmp_path / "f1.png"), frame=1, width=32, height=16),
+        RenderTarget("branch_b", str(tmp_path / "f2.png"), frame=2, width=32, height=16),
+        RenderTarget("branch_b", str(tmp_path / "hd.png"), frame=2, width=64, height=64),
+    ]
+    cancel_after = iter([False] * 7 + [True])
+
+    with pytest.raises(RenderCancelled):
+        TextureEngine(graph, cache).render_batch(targets, is_cancelled=lambda: next(cancel_after))
+
+    assert not any(Path(target.path).exists() for target in targets)
+
+    resumed = []
+    original_evaluate = TextureEngine.evaluate
+
+    def tracked_evaluate(
+        self,
+        output_node,
+        context=None,
+        frame=0,
+        width=None,
+        height=None,
+    ):
+        resumed.append((output_node, frame, width, height))
+        return original_evaluate(
+            self,
+            output_node,
+            context,
+            frame=frame,
+            width=width,
+            height=height,
+        )
+
+    TextureEngine.evaluate = tracked_evaluate
+    try:
+        TextureEngine(graph, cache).render_batch(targets)
+    finally:
+        TextureEngine.evaluate = original_evaluate
+
+    sizes = {}
+    for target in targets:
+        assert Path(target.path).exists()
+        with Image.open(target.path) as image:
+            sizes[Path(target.path).name] = image.size
+    assert sizes == {
+        "preview.png": (256, 256),
+        "f0.png": (32, 16),
+        "f1.png": (32, 16),
+        "f2.png": (32, 16),
+        "hd.png": (64, 64),
+    }
+    assert [item[0] for item in resumed] == [target.output_node for target in targets]
+    assert [item[1] for item in resumed] == [target.frame for target in targets]
+    assert [item[2:] for item in resumed] == [
+        (target.width, target.height) for target in targets
+    ]

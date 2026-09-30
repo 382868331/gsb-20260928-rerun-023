@@ -6,6 +6,20 @@ from .errors import CycleError, GraphValidationError
 
 
 @dataclass(frozen=True)
+class Keyframe:
+    frame: int
+    value: Any
+
+
+@dataclass(frozen=True)
+class Track:
+    node_id: str
+    param: str
+    interpolation: str = "linear"
+    keyframes: tuple[Keyframe, ...] = ()
+
+
+@dataclass(frozen=True)
 class Node:
     id: str
     type: str
@@ -26,6 +40,33 @@ class Graph:
     height: int = 256
     nodes: dict[str, Node] = field(default_factory=dict)
     connections: list[Connection] = field(default_factory=list)
+    tracks: dict[tuple[str, str], Track] = field(default_factory=dict)
+
+    def add_keyframe(
+        self,
+        node_id: str,
+        param: str,
+        frame: int,
+        value: Any,
+        interpolation: str = "linear",
+    ) -> None:
+        if interpolation not in ("linear", "step"):
+            raise ValueError(f"unsupported keyframe interpolation: {interpolation}")
+        key = (node_id, param)
+        track = self.tracks.get(key)
+        keyframes = list(track.keyframes if track else ())
+        if any(item.frame == frame for item in keyframes):
+            raise ValueError(f"duplicate keyframe for {node_id}.{param} at frame {frame}")
+        keyframes.append(Keyframe(int(frame), value))
+        keyframes.sort(key=lambda item: item.frame)
+        self.tracks[key] = Track(node_id, param, interpolation, tuple(keyframes))
+
+    def params_at(self, node_id: str, frame: int) -> dict[str, Any]:
+        params = dict(self.nodes[node_id].params)
+        for (track_node_id, param), track in self.tracks.items():
+            if track_node_id == node_id:
+                params[param] = sample_track(track, int(frame))
+        return params
 
     def add_node(
         self,
@@ -109,6 +150,11 @@ class Graph:
                 raise GraphValidationError(f"unknown source node: {connection.source_node}")
             if connection.target_node not in self.nodes:
                 raise GraphValidationError(f"unknown target node: {connection.target_node}")
+        for (node_id, _param), track in self.tracks.items():
+            if node_id not in self.nodes:
+                raise GraphValidationError(f"unknown animated node: {node_id}")
+            if not track.keyframes:
+                raise GraphValidationError(f"animation track for {node_id} has no keyframes")
 
     def _reachable_from(self, output_node: str | None) -> set[str]:
         if output_node is None:
@@ -150,3 +196,31 @@ class Graph:
             if found:
                 return found
         return list(scope)
+
+
+def sample_track(track: Track, frame: int) -> Any:
+    keyframes = list(track.keyframes)
+    if frame <= keyframes[0].frame:
+        return keyframes[0].value
+    if frame >= keyframes[-1].frame:
+        return keyframes[-1].value
+    for previous, current in zip(keyframes, keyframes[1:]):
+        if frame == current.frame:
+            return current.value
+        if previous.frame < frame < current.frame:
+            if track.interpolation == "step":
+                return previous.value
+            fraction = (frame - previous.frame) / (current.frame - previous.frame)
+            return interpolate_value(previous.value, current.value, fraction)
+    return keyframes[-1].value
+
+
+def interpolate_value(start: Any, end: Any, fraction: float) -> Any:
+    if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+        return start + (end - start) * fraction
+    if isinstance(start, (list, tuple)) and isinstance(end, (list, tuple)):
+        if len(start) != len(end):
+            raise ValueError("keyframe values must have the same length")
+        result = [interpolate_value(a, b, fraction) for a, b in zip(start, end)]
+        return result if isinstance(start, list) else tuple(result)
+    raise ValueError("linear interpolation requires numeric or sequence keyframe values")

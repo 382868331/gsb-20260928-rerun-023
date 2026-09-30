@@ -1,0 +1,137 @@
+{
+  "connections": [
+    {
+      "source_node": "uv",
+      "source_port": "value",
+      "target_node": "transform",
+      "target_port": "coordinates"
+    },
+    {
+      "source_node": "transform",
+      "source_port": "value",
+      "target_node": "mask",
+      "target_port": "coordinates"
+    },
+    {
+      "source_node": "fill",
+      "source_port": "value",
+      "target_node": "result",
+      "target_port": "foreground"
+    },
+    {
+      "source_node": "background",
+      "source_port": "value",
+      "target_node": "result",
+      "target_port": "background"
+    },
+    {
+      "source_node": "mask",
+      "source_port": "value",
+      "target_node": "result",
+      "target_port": "mask"
+    }
+  ],
+  "height": 256,
+  "nodes": [
+    {
+      "id": "background",
+      "params": {
+        "color": [
+          0.02,
+          0.03,
+          0.08,
+          1.0
+        ]
+      },
+      "type": "solid_color"
+    },
+    {
+      "id": "fill",
+      "params": {
+        "color": [
+          0.15,
+          0.65,
+          0.95,
+          1.0
+        ]
+      },
+      "type": "solid_color"
+    },
+    {
+      "id": "mask",
+      "params": {
+        "radius": 0.32,
+        "softness": 0.02
+      },
+      "type": "circle_mask"
+    },
+    {
+      "id": "result",
+      "params": {},
+      "type": "blend_colors"
+    },
+    {
+      "id": "transform",
+      "params": {},
+      "type": "transform_coordinates"
+    },
+    {
+      "id": "uv",
+      "params": {},
+      "type": "uv_coordinates"
+    }
+  ],
+  "outputs": [
+    {
+      "frame": 0,
+      "node_id": "result",
+      "path": "outputs/moving-preview.png"
+    },
+    {
+      "frame": 0,
+      "node_id": "result",
+      "path": "outputs/moving-frame-0.png"
+    },
+    {
+      "frame": 1,
+      "node_id": "result",
+      "path": "outputs/moving-frame-1.png"
+    },
+    {
+      "frame": 2,
+      "node_id": "result",
+      "path": "outputs/moving-frame-2.png"
+    },
+    {
+      "frame": 3,
+      "node_id": "result",
+      "path": "outputs/moving-frame-3.png"
+    },
+    {
+      "frame": 3,
+      "height": 512,
+      "node_id": "result",
+      "path": "outputs/moving-hd.png",
+      "width": 512
+    }
+  ],
+  "tracks": [
+    {
+      "interpolation": "linear",
+      "keyframes": [
+        {
+          "frame": 0,
+          "value": -0.7
+        },
+        {
+          "frame": 3,
+          "value": 0.7
+        }
+      ],
+      "node_id": "transform",
+      "param": "offset_x"
+    }
+  ],
+  "version": 2,
+  "width": 256
+}

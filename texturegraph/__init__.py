@@ -1,6 +1,6 @@
 """A small cached, deterministic texture-node graph engine."""
 
-from .engine import EvaluationCache, RenderContext, TextureEngine
+from .engine import EvaluationCache, RenderContext, RenderTarget, TextureEngine
 from .errors import CycleError, GraphValidationError, RenderCancelled
 from .graph import Connection, Graph, Node
 from .project import load_project, render_project, save_project
@@ -14,6 +14,7 @@ __all__ = [
     "Node",
     "RenderCancelled",
     "RenderContext",
+    "RenderTarget",
     "TextureEngine",
     "load_project",
     "render_project",

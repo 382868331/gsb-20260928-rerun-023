@@ -132,10 +132,19 @@
       "type": "uv_coordinates"
     }
   ],
-  "outputs": {
-    "branch_a": "outputs/red-circle.png",
-    "branch_b": "outputs/gold-circle.png"
-  },
-  "version": 1,
+  "outputs": [
+    {
+      "frame": 0,
+      "node_id": "branch_a",
+      "path": "outputs/red-circle.png"
+    },
+    {
+      "frame": 0,
+      "node_id": "branch_b",
+      "path": "outputs/gold-circle.png"
+    }
+  ],
+  "tracks": [],
+  "version": 2,
   "width": 256
 }
