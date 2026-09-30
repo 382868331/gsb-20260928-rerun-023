@@ -203,6 +203,21 @@ def render_project(
     cache: EvaluationCache | None = None,
     resume: bool = True,
 ) -> dict[str, str]:
+    rendered, _ = render_project_detailed(
+        project_path,
+        is_cancelled=is_cancelled,
+        cache=cache,
+        resume=resume,
+    )
+    return rendered
+
+
+def render_project_detailed(
+    project_path: str,
+    is_cancelled: Callable[[], bool] = lambda: False,
+    cache: EvaluationCache | None = None,
+    resume: bool = True,
+) -> tuple[dict[str, str], list]:
     project_path = str(Path(project_path))
     project_directory = os.path.dirname(os.path.abspath(project_path))
     graph, outputs, data = load_project(project_path)
@@ -245,7 +260,7 @@ def render_project(
     rendered: dict[str, str] = {}
     for result in results:
         rendered.update(result.outputs)
-    return rendered
+    return rendered, results
 
 
 def resolve_output_path(path: str, project_directory: str) -> str:

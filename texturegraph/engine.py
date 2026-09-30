@@ -3,11 +3,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 import numpy as np
 from PIL import Image as PilImage
+from PIL.PngImagePlugin import PngInfo
 
 from .errors import GraphValidationError, RenderCancelled
 from .graph import Graph
@@ -15,7 +16,7 @@ from .nodes import NODE_TYPES, NodeType
 
 # Bump when node execution semantics or the signature payload change so old
 # cached masks/frames can never be mistaken for current results.
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,9 @@ class FrameResult:
     time: float
     outputs: dict[str, str]
     skipped: bool = False
+    reused: dict[str, str] = field(default_factory=dict)
+    rendered: dict[str, str] = field(default_factory=dict)
+    reasons: dict[str, str] = field(default_factory=dict)
 
 
 class RenderContext:
@@ -181,26 +185,48 @@ class TextureEngine:
     ) -> list[FrameResult]:
         """Render and atomically publish frames.
 
-        Each frame is an independent publish: outputs committed by earlier
-        frames are never overwritten or removed.  With resume enabled (the
-        default), frames whose PNGs already exist at the requested node and
-        resolution are skipped, so a cancelled batch can continue without
-        repeating or dropping frames and without mixing resolutions.
+        Each frame is an independent publish.  With resume enabled (the
+        default), a PNG is reused only when its embedded signature matches the
+        output's current node, size, time, parameters and upstream signatures,
+        and its decoded pixels match the digest captured at publication.
         """
 
         results: list[FrameResult] = []
         for frame in frames:
             context = RenderContext(is_cancelled=is_cancelled, time=frame.time)
-            existing = {
-                output.node_id: output.path
-                for output in frame.outputs
-                if resume and published_png_is_valid(output)
-            }
-            pending = [
-                output for output in frame.outputs if output.node_id not in existing
-            ]
+            reused: dict[str, str] = {}
+            rendered_paths: dict[str, str] = {}
+            reasons: dict[str, str] = {}
+            pending: list[FrameOutput] = []
+            for output in frame.outputs:
+                expected_signature = self.signature_for(
+                    output.node_id,
+                    output.width,
+                    output.height,
+                    frame.time,
+                )
+                if resume and published_png_is_valid(output, expected_signature):
+                    reused[output.node_id] = output.path
+                    reasons[output.node_id] = (
+                        "reused published PNG: size and complete dependency "
+                        "signature match, and pixel digest is intact"
+                    )
+                else:
+                    pending.append(output)
+                    reasons[output.node_id] = (
+                        "rendered: file is missing or its size, dependency "
+                        "signature, or pixel digest does not match current input"
+                    )
             if not pending:
-                results.append(FrameResult(frame.time, existing, skipped=True))
+                results.append(
+                    FrameResult(
+                        frame.time,
+                        {output.node_id: output.path for output in frame.outputs},
+                        skipped=True,
+                        reused=reused,
+                        reasons=reasons,
+                    )
+                )
                 continue
 
             # Share values across outputs of THIS frame (same time and same
@@ -218,16 +244,40 @@ class TextureEngine:
                     scope,
                 )
                 rendered.append((output, value))
+            context.raise_if_cancelled()
             for output, value in rendered:
-                write_png_atomic(value, output.path)
-                existing[output.node_id] = output.path
+                signature = self.signature_for(
+                    output.node_id,
+                    output.width,
+                    output.height,
+                    frame.time,
+                )
+                write_png_atomic(value, output.path, signature)
+                rendered_paths[output.node_id] = output.path
+            all_outputs = {}
+            all_outputs.update(reused)
+            all_outputs.update(rendered_paths)
             results.append(
                 FrameResult(
                     frame.time,
-                    {output.node_id: output.path for output in frame.outputs},
+                    all_outputs,
+                    skipped=False,
+                    reused=reused,
+                    rendered=rendered_paths,
+                    reasons=reasons,
                 )
             )
         return results
+
+    def signature_for(
+        self,
+        output_node: str,
+        width: int,
+        height: int,
+        time: float,
+    ) -> str:
+        order = self.graph.topological_order(output_node)
+        return self._signatures(order, width, height, time)[output_node]
 
     def _prepare_inputs(self, node_id: str, node_type: NodeType, values):
         incoming = self.graph.inputs_for(node_id)
@@ -292,6 +342,7 @@ class TextureEngine:
                 input_signatures[port_name] = result[connection.source_node]
             payload = {
                 "cache_version": CACHE_VERSION,
+                "node_id": node_id,
                 "size": [width, height],
                 "type": node.type,
                 "output_type": node_type.output_type,
@@ -333,8 +384,8 @@ def to_pil_image(value) -> PilImage.Image:
     return PilImage.fromarray(channels, mode="RGBA")
 
 
-def published_png_is_valid(output: FrameOutput) -> bool:
-    """A published file counts only at the requested resolution."""
+def published_png_is_valid(output: FrameOutput, expected_signature: str) -> bool:
+    """Validate resolution, dependency signature and decoded pixel content."""
     import os
 
     if not os.path.exists(output.path):
@@ -342,20 +393,41 @@ def published_png_is_valid(output: FrameOutput) -> bool:
     try:
         with PilImage.open(output.path) as image:
             image.load()
-            return tuple(image.size) == (output.width, output.height)
+            if tuple(image.size) != (output.width, output.height):
+                return False
+            if image.info.get("TextureGraph-Signature") != expected_signature:
+                return False
+            pixels = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+            digest = image_digest(pixels)
+            return image.info.get("TextureGraph-Content-SHA256") == digest
     except Exception:
         return False
 
 
-def write_png_atomic(value, path: str) -> None:
+def image_digest(pixels: np.ndarray) -> str:
+    return hashlib.sha256(np.asarray(pixels, dtype=np.uint8).tobytes()).hexdigest()
+
+
+def write_png_atomic(value, path: str, signature: str) -> None:
     import os
 
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok=True)
     temporary_path = f"{path}.tmp-{os.getpid()}"
     try:
-        image = to_pil_image(value)
-        image.save(temporary_path, format="PNG", compress_level=6)
+        pixels = np.rint(
+            np.clip(np.asarray(value, dtype=np.float32), 0.0, 1.0) * 255.0
+        ).astype(np.uint8)
+        image = PilImage.fromarray(pixels, mode="RGBA")
+        metadata = PngInfo()
+        metadata.add_text("TextureGraph-Signature", signature)
+        metadata.add_text("TextureGraph-Content-SHA256", image_digest(pixels))
+        image.save(
+            temporary_path,
+            format="PNG",
+            compress_level=6,
+            pnginfo=metadata,
+        )
         os.replace(temporary_path, path)
     except BaseException:
         try:

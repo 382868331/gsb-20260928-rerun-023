@@ -284,6 +284,107 @@ def test_resume_checks_resolution_and_replaces_wrong_sized_png(tmp_path):
         assert image.size == (32, 32)
 
 
+def test_resume_checks_parameters_and_keeps_unaffected_output(tmp_path):
+    graph, _ = build_graph()
+    path_a = tmp_path / "branch_a.png"
+    path_b = tmp_path / "branch_b.png"
+    frames = [
+        FrameRequest(
+            0.0,
+            (
+                FrameOutput("branch_a", str(path_a), 32, 32),
+                FrameOutput("branch_b", str(path_b), 32, 32),
+            ),
+        )
+    ]
+    cache = EvaluationCache()
+    TextureEngine(graph, cache).render_frames(frames, resume=False)
+    original_a = path_a.read_bytes()
+    original_b = path_b.read_bytes()
+
+    graph.set_param("red", "color", [0.0, 0.9, 0.1, 1.0])
+    results = TextureEngine(graph, cache).render_frames(frames)
+
+    assert path_a.read_bytes() != original_a
+    assert path_b.read_bytes() == original_b
+    assert results[0].rendered == {"branch_a": str(path_a)}
+    assert results[0].reused == {"branch_b": str(path_b)}
+    assert "complete dependency signature match" in results[0].reasons["branch_b"]
+    assert "signature" in results[0].reasons["branch_a"]
+
+
+def test_resume_shared_input_change_recomputes_only_dependent_outputs(tmp_path):
+    graph, _ = build_graph()
+    graph.add_node("independent", "solid_color", {"color": [0.3, 0.3, 0.3, 1]})
+    path_a = tmp_path / "branch_a.png"
+    path_b = tmp_path / "branch_b.png"
+    independent_path = tmp_path / "independent.png"
+    frames = [
+        FrameRequest(
+            0.0,
+            (
+                FrameOutput("branch_a", str(path_a), 32, 32),
+                FrameOutput("branch_b", str(path_b), 32, 32),
+                FrameOutput("independent", str(independent_path), 32, 32),
+            ),
+        )
+    ]
+    cache = EvaluationCache()
+    TextureEngine(graph, cache).render_frames(frames, resume=False)
+    original = {
+        "branch_a": path_a.read_bytes(),
+        "branch_b": path_b.read_bytes(),
+        "independent": independent_path.read_bytes(),
+    }
+
+    graph.set_param("shared_mask", "radius", 0.2)
+    results = TextureEngine(graph, cache).render_frames(frames)
+
+    assert path_a.read_bytes() != original["branch_a"]
+    assert path_b.read_bytes() != original["branch_b"]
+    assert independent_path.read_bytes() == original["independent"]
+    assert set(results[0].rendered) == {"branch_a", "branch_b"}
+    assert set(results[0].reused) == {"independent"}
+
+
+def test_resume_replaces_same_sized_content_from_different_task(tmp_path):
+    graph, _ = build_graph()
+    target = tmp_path / "branch_a.png"
+    source = tmp_path / "branch_b.png"
+    frames = [
+        FrameRequest(
+            0.0,
+            (
+                FrameOutput("branch_a", str(target), 32, 32),
+                FrameOutput("branch_b", str(source), 32, 32),
+            ),
+        )
+    ]
+    TextureEngine(graph, EvaluationCache()).render_frames(frames, resume=False)
+    expected_a = target.read_bytes()
+    target.write_bytes(source.read_bytes())
+
+    results = TextureEngine(graph, EvaluationCache()).render_frames(frames)
+
+    assert target.read_bytes() == expected_a
+    assert results[0].rendered == {"branch_a": str(target)}
+    assert results[0].reused == {"branch_b": str(source)}
+
+
+def test_unfinished_temporary_file_is_not_treated_as_published_result(tmp_path):
+    output = tmp_path / "image.png"
+    temporary = tmp_path / "image.png.tmp-12345"
+    graph, _ = build_graph()
+    frame = FrameRequest(0.0, (FrameOutput("branch_a", str(output), 32, 32),))
+    temporary.write_bytes(b"not a published png")
+
+    results = TextureEngine(graph, EvaluationCache()).render_frames([frame])
+
+    assert results[0].rendered == {"branch_a": str(output)}
+    assert output.exists()
+    assert temporary.read_bytes() == b"not a published png"
+
+
 def test_frames_actually_change_with_the_moving_mask(tmp_path):
     graph, _ = build_graph()
     engine = TextureEngine(graph, EvaluationCache())
