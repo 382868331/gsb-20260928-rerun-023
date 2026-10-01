@@ -27,6 +27,7 @@ class FrameOutput:
     path: str
     width: int
     height: int
+    label: str = ""
 
 
 @dataclass(frozen=True)
@@ -252,7 +253,7 @@ class TextureEngine:
                     output.height,
                     frame.time,
                 )
-                write_png_atomic(value, output.path, signature)
+                write_png_atomic(value, output.path, signature, label=output.label)
                 rendered_paths[output.node_id] = output.path
             all_outputs = {}
             all_outputs.update(reused)
@@ -397,6 +398,8 @@ def published_png_is_valid(output: FrameOutput, expected_signature: str) -> bool
                 return False
             if image.info.get("TextureGraph-Signature") != expected_signature:
                 return False
+            if output.label and image.info.get("TextureGraph-Label") != output.label:
+                return False
             pixels = np.asarray(image.convert("RGBA"), dtype=np.uint8)
             digest = image_digest(pixels)
             return image.info.get("TextureGraph-Content-SHA256") == digest
@@ -408,7 +411,7 @@ def image_digest(pixels: np.ndarray) -> str:
     return hashlib.sha256(np.asarray(pixels, dtype=np.uint8).tobytes()).hexdigest()
 
 
-def write_png_atomic(value, path: str, signature: str) -> None:
+def write_png_atomic(value, path: str, signature: str, label: str = "") -> None:
     import os
 
     directory = os.path.dirname(os.path.abspath(path)) or "."
@@ -422,6 +425,8 @@ def write_png_atomic(value, path: str, signature: str) -> None:
         metadata = PngInfo()
         metadata.add_text("TextureGraph-Signature", signature)
         metadata.add_text("TextureGraph-Content-SHA256", image_digest(pixels))
+        if label:
+            metadata.add_text("TextureGraph-Label", label)
         image.save(
             temporary_path,
             format="PNG",
