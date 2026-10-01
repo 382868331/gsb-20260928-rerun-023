@@ -49,6 +49,7 @@ class FrameResult:
     reused: dict[str, str] = field(default_factory=dict)
     rendered: dict[str, str] = field(default_factory=dict)
     reasons: dict[str, str] = field(default_factory=dict)
+    variant: str | None = None
 
 
 class RenderContext:
@@ -86,10 +87,21 @@ class EvaluationCache:
 
 
 class TextureEngine:
-    def __init__(self, graph: Graph, cache: EvaluationCache | None = None) -> None:
+    def __init__(
+        self,
+        graph: Graph,
+        cache: EvaluationCache | None = None,
+        variant_id: str | None = None,
+    ) -> None:
         graph.validate_references()
         self.graph = graph
         self.cache = cache or EvaluationCache()
+        # When set, the published-output signature is stamped with the
+        # variant id so two parameter schemes can never claim each other's
+        # PNG, even when their effective params, node names and sizes match.
+        # Intermediate (cache) signatures stay variant-agnostic so shared
+        # inputs are still computed only once across variants.
+        self.variant_id = variant_id
 
     def render_image(
         self,
@@ -277,7 +289,15 @@ class TextureEngine:
         time: float,
     ) -> str:
         order = self.graph.topological_order(output_node)
-        return self._signatures(order, width, height, time)[output_node]
+        signature = self._signatures(order, width, height, time)[output_node]
+        if self.variant_id is not None:
+            payload = json.dumps(
+                {"variant": self.variant_id, "signature": signature},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            signature = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return signature
 
     def _prepare_inputs(self, node_id: str, node_type: NodeType, values):
         incoming = self.graph.inputs_for(node_id)

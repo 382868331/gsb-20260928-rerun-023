@@ -1,0 +1,206 @@
+{
+  "connections": [
+    {
+      "source_node": "uv",
+      "source_port": "value",
+      "target_node": "circle_transform",
+      "target_port": "coordinates"
+    },
+    {
+      "source_node": "circle_transform",
+      "source_port": "value",
+      "target_node": "shared_mask",
+      "target_port": "coordinates"
+    },
+    {
+      "source_node": "red",
+      "source_port": "value",
+      "target_node": "branch_a",
+      "target_port": "foreground"
+    },
+    {
+      "source_node": "dark_blue",
+      "source_port": "value",
+      "target_node": "branch_a",
+      "target_port": "background"
+    },
+    {
+      "source_node": "shared_mask",
+      "source_port": "value",
+      "target_node": "branch_a",
+      "target_port": "mask"
+    },
+    {
+      "source_node": "gold",
+      "source_port": "value",
+      "target_node": "branch_b",
+      "target_port": "foreground"
+    },
+    {
+      "source_node": "dark_green",
+      "source_port": "value",
+      "target_node": "branch_b",
+      "target_port": "background"
+    },
+    {
+      "source_node": "shared_mask",
+      "source_port": "value",
+      "target_node": "branch_b",
+      "target_port": "mask"
+    }
+  ],
+  "height": 64,
+  "jobs": [
+    {
+      "height": 64,
+      "id": "preview-a",
+      "kind": "static",
+      "node": "branch_a",
+      "path": "outputs/variants/{variant}/branch_a.png",
+      "time": 0.5,
+      "width": 64
+    },
+    {
+      "height": 64,
+      "id": "preview-b",
+      "kind": "static",
+      "node": "branch_b",
+      "path": "outputs/variants/{variant}/branch_b.png",
+      "time": 0.5,
+      "width": 64
+    }
+  ],
+  "nodes": [
+    {
+      "id": "branch_a",
+      "params": {},
+      "type": "blend_colors"
+    },
+    {
+      "id": "branch_b",
+      "params": {},
+      "type": "blend_colors"
+    },
+    {
+      "id": "circle_transform",
+      "params": {
+        "offset_x": -0.5,
+        "rotation_degrees": 20,
+        "scale_x": 1.25,
+        "scale_y": 0.75
+      },
+      "type": "transform_coordinates"
+    },
+    {
+      "id": "dark_blue",
+      "params": {
+        "color": [
+          0.04,
+          0.08,
+          0.2,
+          1.0
+        ]
+      },
+      "type": "solid_color"
+    },
+    {
+      "id": "dark_green",
+      "params": {
+        "color": [
+          0.03,
+          0.13,
+          0.08,
+          1.0
+        ]
+      },
+      "type": "solid_color"
+    },
+    {
+      "id": "gold",
+      "params": {
+        "color": [
+          0.95,
+          0.72,
+          0.18,
+          1.0
+        ]
+      },
+      "type": "solid_color"
+    },
+    {
+      "id": "red",
+      "params": {
+        "color": [
+          0.85,
+          0.12,
+          0.1,
+          1.0
+        ]
+      },
+      "type": "solid_color"
+    },
+    {
+      "id": "shared_mask",
+      "params": {
+        "radius": 0.45,
+        "softness": 0.03
+      },
+      "type": "circle_mask"
+    },
+    {
+      "id": "uv",
+      "params": {},
+      "type": "uv_coordinates"
+    }
+  ],
+  "outputs": {},
+  "tracks": [
+    {
+      "interpolation": "linear",
+      "keyframes": [
+        {
+          "time": 0.0,
+          "value": -0.5
+        },
+        {
+          "time": 1.0,
+          "value": 0.5
+        }
+      ],
+      "node": "circle_transform",
+      "param": "offset_x"
+    }
+  ],
+  "variants": [
+    {
+      "id": "base",
+      "label": "\u539f\u59cb\u65b9\u6848",
+      "overrides": {}
+    },
+    {
+      "id": "small",
+      "label": "\u66f4\u5c0f\u7684\u5171\u4eab\u906e\u7f69",
+      "overrides": {
+        "shared_mask": {
+          "radius": 0.25
+        }
+      }
+    },
+    {
+      "id": "warm",
+      "label": "\u6696\u8272\u524d\u666f",
+      "overrides": {
+        "red": {
+          "color": [
+            0.95,
+            0.55,
+            0.1,
+            1.0
+          ]
+        }
+      }
+    }
+  ],
+  "version": 3,
+  "width": 64
+}

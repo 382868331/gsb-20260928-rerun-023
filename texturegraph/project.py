@@ -14,8 +14,9 @@ from .engine import (
     TextureEngine,
 )
 from .graph import Connection, Graph
+from .variants import Variant, apply_variant
 
-PROJECT_VERSION = 2
+PROJECT_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -37,9 +38,15 @@ class RenderJob:
     start_time: float = 0.0
     end_time: float = 0.0
     frame_count: int = 1
+    # When the project declares variants, this job runs once per listed
+    # variant id (None = every variant).  The path may contain {variant}.
+    variants: tuple[str, ...] | None = None
 
-    def frames(self, project_directory: str) -> list[FrameRequest]:
-        base = resolve_output_path(self.path, project_directory)
+    def frames(
+        self, project_directory: str, variant_id: str | None = None
+    ) -> list[FrameRequest]:
+        path = self.path if variant_id is None else self.path.format(variant=variant_id)
+        base = resolve_output_path(path, project_directory)
         if self.kind == "static":
             output = FrameOutput(self.node, base, self.width, self.height)
             return [FrameRequest(float(self.time), (output,))]
@@ -74,6 +81,7 @@ def graph_to_dict(
     graph: Graph,
     outputs: dict[str, str] | None = None,
     jobs: list[RenderJob] | None = None,
+    variants: list[Variant] | None = None,
 ) -> dict:
     document = {
         "version": PROJECT_VERSION,
@@ -95,8 +103,28 @@ def graph_to_dict(
         "tracks": tracks_to_list(graph.tracks.values()),
         "outputs": dict(sorted((outputs or {}).items())),
         "jobs": [job_to_dict(job) for job in sorted(jobs or [], key=lambda item: item.id)],
+        "variants": [variant_to_dict(v) for v in sorted(variants or [], key=lambda item: item.id)],
     }
     return document
+
+
+def variant_to_dict(variant: Variant) -> dict:
+    document = {"id": variant.id, "overrides": variant.overrides}
+    if variant.label is not None:
+        document["label"] = variant.label
+    return document
+
+
+def variant_from_dict(document: dict) -> Variant:
+    overrides = {
+        str(node_id): dict(params)
+        for node_id, params in document.get("overrides", {}).items()
+    }
+    return Variant(
+        id=document["id"],
+        overrides=overrides,
+        label=document.get("label"),
+    )
 
 
 def job_to_dict(job: RenderJob) -> dict:
@@ -114,6 +142,8 @@ def job_to_dict(job: RenderJob) -> dict:
         document["start_time"] = float(job.start_time)
         document["end_time"] = float(job.end_time)
         document["frame_count"] = int(job.frame_count)
+    if job.variants is not None:
+        document["variants"] = list(job.variants)
     return document
 
 
@@ -126,6 +156,8 @@ def job_from_dict(document: dict, graph: Graph) -> RenderJob:
     if width <= 0 or height <= 0:
         raise ValueError("job width and height must be positive")
     kind = document.get("kind", "static")
+    variants = document.get("variants")
+    variants = tuple(variants) if variants is not None else None
     if kind == "static":
         return RenderJob(
             id=document["id"],
@@ -135,6 +167,7 @@ def job_from_dict(document: dict, graph: Graph) -> RenderJob:
             width=width,
             height=height,
             time=float(document.get("time", 0.0)),
+            variants=variants,
         )
     if kind == "sequence":
         return RenderJob(
@@ -147,11 +180,14 @@ def job_from_dict(document: dict, graph: Graph) -> RenderJob:
             start_time=float(document["start_time"]),
             end_time=float(document["end_time"]),
             frame_count=int(document["frame_count"]),
+            variants=variants,
         )
     raise ValueError(f"unknown render job kind: {kind}")
 
 
-def graph_from_dict(data: dict) -> tuple[Graph, dict[str, str], list[RenderJob]]:
+def graph_from_dict(
+    data: dict,
+) -> tuple[Graph, dict[str, str], list[RenderJob], list[Variant]]:
     graph = Graph(width=int(data["width"]), height=int(data["height"]))
     if graph.width <= 0 or graph.height <= 0:
         raise ValueError("width and height must be positive")
@@ -170,8 +206,9 @@ def graph_from_dict(data: dict) -> tuple[Graph, dict[str, str], list[RenderJob]]
         graph.add_track(track_from_dict(item))
     outputs = dict(data.get("outputs", {}))
     jobs = [job_from_dict(item, graph) for item in data.get("jobs", [])]
+    variants = [variant_from_dict(item) for item in data.get("variants", [])]
     graph.validate_references()
-    return graph, outputs, jobs
+    return graph, outputs, jobs, variants
 
 
 def save_project(
@@ -179,8 +216,9 @@ def save_project(
     graph: Graph,
     outputs: dict[str, str] | None = None,
     jobs: list[RenderJob] | None = None,
+    variants: list[Variant] | None = None,
 ) -> None:
-    document = graph_to_dict(graph, outputs, jobs)
+    document = graph_to_dict(graph, outputs, jobs, variants)
     temporary = f"{path}.tmp"
     with open(temporary, "w", encoding="utf-8") as handle:
         json.dump(document, handle, indent=2, sort_keys=True)
@@ -191,9 +229,10 @@ def save_project(
 def load_project(path: str) -> tuple[Graph, dict[str, str], dict]:
     with open(path, "r", encoding="utf-8") as handle:
         data = json.load(handle)
-    graph, outputs, jobs = graph_from_dict(data)
+    graph, outputs, jobs, variants = graph_from_dict(data)
     data = dict(data)
     data["jobs"] = jobs
+    data["variants"] = variants
     return graph, outputs, data
 
 
@@ -202,12 +241,14 @@ def render_project(
     is_cancelled: Callable[[], bool] = lambda: False,
     cache: EvaluationCache | None = None,
     resume: bool = True,
+    only_variants: list[str] | None = None,
 ) -> dict[str, str]:
     rendered, _ = render_project_detailed(
         project_path,
         is_cancelled=is_cancelled,
         cache=cache,
         resume=resume,
+        only_variants=only_variants,
     )
     return rendered
 
@@ -217,12 +258,14 @@ def render_project_detailed(
     is_cancelled: Callable[[], bool] = lambda: False,
     cache: EvaluationCache | None = None,
     resume: bool = True,
+    only_variants: list[str] | None = None,
 ) -> tuple[dict[str, str], list]:
     project_path = str(Path(project_path))
     project_directory = os.path.dirname(os.path.abspath(project_path))
     graph, outputs, data = load_project(project_path)
-    engine = TextureEngine(graph, cache)
     jobs: list[RenderJob] = data.get("jobs", [])
+    variants: list[Variant] = data.get("variants", [])
+    cache = cache or EvaluationCache()
 
     if data.get("version", 1) < 2 and not jobs and outputs:
         jobs = [
@@ -237,6 +280,20 @@ def render_project_detailed(
             )
             for node_id, path in outputs.items()
         ]
+
+    if variants:
+        return _render_project_variants(
+            graph,
+            jobs,
+            variants,
+            project_directory,
+            is_cancelled=is_cancelled,
+            cache=cache,
+            resume=resume,
+            only_variants=only_variants,
+        )
+
+    engine = TextureEngine(graph, cache)
 
     # Merge job requests by time (paths make outputs unique), but only at the
     # exact same time.  Sequence frames at distinct times stay separate, so a
@@ -260,6 +317,80 @@ def render_project_detailed(
     rendered: dict[str, str] = {}
     for result in results:
         rendered.update(result.outputs)
+    return rendered, results
+
+
+def _render_project_variants(
+    graph: Graph,
+    jobs: list[RenderJob],
+    variants: list[Variant],
+    project_directory: str,
+    is_cancelled: Callable[[], bool] = lambda: False,
+    cache: EvaluationCache | None = None,
+    resume: bool = True,
+    only_variants: list[str] | None = None,
+) -> tuple[dict[str, str], list]:
+    """Render every job for each selected parameter scheme.
+
+    One shared evaluation cache means inputs and intermediate results that
+    no override touches are computed once for the whole batch; each scheme
+    still publishes PNGs stamped with its own variant id.
+    """
+    import dataclasses
+
+    from .variants import select_variants
+
+    selected = select_variants(variants, only_variants)
+    cache = cache or EvaluationCache()
+
+    # Every (job, variant) pair must resolve to a distinct path so schemes
+    # cannot replace each other's published files.
+    seen_paths: dict[str, str] = {}
+    for job in jobs:
+        job_variants = select_variants(variants, job.variants)
+        for variant in job_variants:
+            if variant not in selected:
+                continue
+            for request in job.frames(project_directory, variant.id):
+                for output in request.outputs:
+                    path = os.path.abspath(output.path)
+                    owner = seen_paths.get(path)
+                    if owner is not None and owner != variant.id:
+                        raise ValueError(
+                            f"job {job.id!r} path collides between schemes "
+                            f"{owner!r} and {variant.id!r}: {path}"
+                        )
+                    seen_paths[path] = variant.id
+
+    rendered: dict[str, str] = {}
+    results: list = []
+    for variant in selected:
+        derived = apply_variant(graph, variant)
+        engine = TextureEngine(derived, cache, variant_id=variant.id)
+        frames_by_time: dict[float, dict[str, FrameOutput]] = {}
+        order: list[float] = []
+        for job in jobs:
+            job_variants = select_variants(variants, job.variants)
+            if variant not in job_variants:
+                continue
+            for request in job.frames(project_directory, variant.id):
+                time = float(request.time)
+                if time not in frames_by_time:
+                    frames_by_time[time] = {}
+                    order.append(time)
+                for output in request.outputs:
+                    frames_by_time[time][output.path] = output
+        frames = [
+            FrameRequest(time, tuple(frames_by_time[time].values()))
+            for time in order
+        ]
+        frame_results = engine.render_frames(
+            frames, is_cancelled=is_cancelled, resume=resume
+        )
+        for result in frame_results:
+            result = dataclasses.replace(result, variant=variant.id)
+            results.append(result)
+            rendered.update(result.outputs)
     return rendered, results
 
 
