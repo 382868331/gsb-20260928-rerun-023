@@ -167,3 +167,59 @@ NODE_TYPES: dict[str, NodeType] = {
         ),
     ]
 }
+
+
+# How far (in pixels) a node mixes neighbouring pixels into each output
+# pixel.  0 means purely pointwise; filters/neighbourhood ops advertise a
+# positive radius so region recomputes can dilate a user rectangle into the
+# full halo that must be recomputed to avoid visible seams.
+#
+# Transformations of coordinates are NOT neighbourhood operations: every
+# output pixel still depends on at most one input location.
+NEIGHBORHOOD_RADIUS_PARAM: dict[str, str] = {}
+
+
+def neighborhood_radius(node_type: str, params: dict[str, Any]) -> int:
+    """Pixel radius that must be added around a region for ``node_type``."""
+    param_name = NEIGHBORHOOD_RADIUS_PARAM.get(node_type)
+    if param_name is None:
+        return 0
+    return max(0, int(round(float(params.get(param_name, 0)))))
+
+
+def _neighborhood_box(values: NDArray[np.float32], radius: int) -> NDArray[np.float32]:
+    if radius <= 0:
+        return values
+    count = 2 * radius + 1
+    padded = np.pad(values, ((radius, radius), (radius, radius)) + ((0, 0),) * (values.ndim - 2), mode="edge")
+    # Separable moving average; edge-replication padding keeps frame borders
+    # stable so only genuinely neighbouring pixels influence a region edge.
+    working = padded
+    for axis in (0, 1):
+        windows = []
+        for offset in range(count):
+            index = tuple(
+                slice(offset, offset + values.shape[ax])
+                if ax == axis
+                else slice(None)
+                for ax in range(values.ndim)
+            )
+            windows.append(working[index])
+        working = (sum(windows) / float(count)).astype(np.float32)
+    return working
+
+
+def box_blur(inputs, params, width, height):
+    """Uniform box filter on an image; a genuine cross-region neighbourhood op."""
+    image = inputs["image"]
+    radius = max(0, int(round(float(params.get("radius", 1)))))
+    return _neighborhood_box(np.asarray(image, dtype=np.float32), radius)
+
+
+NODE_TYPES["box_blur"] = NodeType(
+    "box_blur",
+    (Port("image", "image"),),
+    "image",
+    box_blur,
+)
+NEIGHBORHOOD_RADIUS_PARAM["box_blur"] = "radius"
