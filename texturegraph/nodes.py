@@ -115,6 +115,32 @@ def combine_masks(inputs, params, width, height):
     raise ValueError(f"unsupported mask operation: {operation}")
 
 
+def blur_mask(inputs, params, width, height):
+    """Box blur over a mask.
+
+    Neighborhood operation: an output pixel depends on input pixels within
+    ``radius_px`` in every direction, so region edits feeding a blur must
+    expand their recompute footprint past the edited rectangle.
+    """
+
+    mask = np.asarray(inputs["mask"], dtype=np.float32)
+    radius = max(0, int(params.get("radius_px", 1)))
+    if radius == 0:
+        return mask.copy()
+    padded = np.pad(mask, radius, mode="edge")
+    cumulative = np.pad(
+        padded, ((1, 0), (1, 0)), mode="constant"
+    ).cumsum(axis=0).cumsum(axis=1)
+    diameter = 2 * radius + 1
+    total = (
+        cumulative[diameter:, diameter:]
+        - cumulative[:-diameter, diameter:]
+        - cumulative[diameter:, :-diameter]
+        + cumulative[:-diameter, :-diameter]
+    )
+    return (total / (diameter * diameter)).astype(np.float32)
+
+
 def blend_colors(inputs, params, width, height):
     foreground = inputs["foreground"]
     background = inputs["background"]
@@ -154,6 +180,12 @@ NODE_TYPES: dict[str, NodeType] = {
             (Port("a", "mask"), Port("b", "mask")),
             "mask",
             combine_masks,
+        ),
+        NodeType(
+            "blur_mask",
+            (Port("mask", "mask"),),
+            "mask",
+            blur_mask,
         ),
         NodeType(
             "blend_colors",

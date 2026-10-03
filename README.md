@@ -24,6 +24,13 @@ Python 底层的确定性材质节点图。节点图把颜色、二维坐标变�
   - 共享输入变化后，compare 逐方案列出受影响（stale）与仍可用（current）的输出，旧版本保留不删；
   - 可只重算选定方案，其余方案的旧版本继续可用；
   - 某份共享结果损坏时仅受影响输出重算，其他方案已发布内容不受影响。
+ - 区域局部重算与发布（``texturegraph.regions``）：方案先整幅发布为带区域清单的基线版本，之后只改一个画面区域：
+  - ``plan_update`` 预览每个局部候选必须重算的像素矩形与可沿用区域；``preview_update``/``compare_candidate_impacts`` 按候选图真实像素差异扩张足迹并比较各候选对同一已发布版的影响。
+  - 足迹沿下游邻域节点（新增 ``blur_mask`` 盒式模糊，半径 ``radius_px``）向外扩张；拼合后与“整幅重算”逐像素核对，边界不留拼接缝，足迹之外像素与旧发布版逐字节一致。
+  - 两个局部候选重叠时预览互相标记 ``overlaps``，只能二选一或用不相交区域重新划定；同一区域被两个候选认领直接拒绝，禁止把不同候选半成品混成正式版。
+  - 每个区域带显式 ``input_version``：同尺寸同名但来源不同即为不同来源；``release.json`` 为每块区域记录输入版本、候选 id、参数选择（variant）、依赖签名与像素摘要；光晕伸入邻区时以 ``contributors`` 记录来源。
+  - 发布为不可变版本（``releases/<id>/``，旧版永不删除）；取消只在 ``staging/<plan-hash>/`` 留下按完整方案哈希隔离的半成品，续跑只复用签名与摘要都匹配的暂存块。
+  - ``inspect_release``/``inspect_all_releases`` 在输入后来变化或共享结果损坏时逐区域列出 current/stale/damaged 及受影响的发布与方案，未依赖它的发布结果仍可使用。
 
 ## 运行示例
 
@@ -51,6 +58,31 @@ Python 底层的确定性材质节点图。节点图把颜色、二维坐标变�
       {"id": "warm", "overrides": {"red.color": [0.95, 0.4, 0.1, 1.0]}},
       {"id": "cool", "overrides": {"red.color": [0.1, 0.3, 0.95, 1.0]}}
     ]
+
+区域局部重算示例：
+
+    python examples/region_update.py
+
+编程入口：
+
+```python
+from texturegraph import Region, RegionCandidate, RegionPublisher, Variant
+
+publisher = RegionPublisher(graph, "out", 64, 64, root="runs/coating")
+regions = [
+    Region("left", 0, 0, 32, 64, input_version="photo-v1"),
+    Region("right", 32, 0, 32, 64, input_version="photo-v1"),
+]
+baseline = publisher.publish_baseline(regions, "r0")
+candidate = RegionCandidate(
+    "move", Region("left", 0, 0, 32, 64, input_version="photo-v2"),
+    Variant("move", {("circle", "center_x"): 0.35}),
+)
+_base, plans = publisher.preview_update([candidate], baseline)
+release = publisher.publish_update({"left": candidate}, "r1", baseline, plans)
+# 拼合结果在区域内与整幅重算逐像素一致（见 tests/test_regions.py）；
+# 来源清单：runs/coating/releases/r1/release.json
+```
 
 ## 编程用法
 
