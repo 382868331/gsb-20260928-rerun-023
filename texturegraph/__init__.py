@@ -13,6 +13,13 @@ from .engine import (
 from .errors import CycleError, GraphValidationError, RenderCancelled
 from .graph import Connection, Graph, Node
 from .project import RenderJob, load_project, render_project, save_project
+from .regions import (
+    AdoptedTile,
+    Candidate,
+    Region,
+    RegionTarget,
+    RegionWorkspace,
+)
 from .variants import (
     Variant,
     VariantOutputStatus,
@@ -33,6 +40,11 @@ __all__ = [
     "Keyframe",
     "Node",
     "ParameterTrack",
+    "Region",
+    "RegionTarget",
+    "RegionWorkspace",
+    "Candidate",
+    "AdoptedTile",
     "RenderCancelled",
     "RenderContext",
     "RenderJob",

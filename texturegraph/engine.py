@@ -12,11 +12,11 @@ from PIL.PngImagePlugin import PngInfo
 
 from .errors import GraphValidationError, RenderCancelled
 from .graph import Graph
-from .nodes import NODE_TYPES, NodeType
+from .nodes import NODE_TYPES, NodeType, _neighborhood_box, neighborhood_radius
 
 # Bump when node execution semantics or the signature payload change so old
 # cached masks/frames can never be mistaken for current results.
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -102,6 +102,37 @@ class TextureEngine:
     ):
         value = self.evaluate(output_node, context, width, height, time)
         return to_pil_image(value)
+
+    def evaluate_region(
+        self,
+        output_node: str,
+        region: tuple[int, int, int, int],
+        context: RenderContext | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        time: float | None = None,
+        scope: dict[str, object] | None = None,
+        overrides: dict[str, tuple[str, object]] | None = None,
+    ) -> np.ndarray:
+        """Evaluate one output only inside ``region`` = (x0, y0, x1, y1).
+
+        Neighbourhood nodes (e.g. box blur) transparently pull the full halo
+        of pixels across the region border, so boundary pixels are identical
+        to a full-canvas recompute.  ``overrides`` maps ``node_id`` to
+        ``{param: value}`` replacements applied to a throwaway copy of the
+        graph; unchanged upstream nodes keep their signatures and cache.
+        """
+        return evaluate_region(
+            self,
+            output_node,
+            region,
+            context=context,
+            width=width,
+            height=height,
+            time=time,
+            scope=scope,
+            overrides=overrides,
+        )
 
     def evaluate(
         self,
@@ -367,6 +398,234 @@ def stable_json(value) -> object:
     if isinstance(value, np.generic):
         return value.item()
     return value
+
+
+def _clip_box(
+    box: tuple[int, int, int, int], width: int, height: int
+) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = box
+    return (
+        max(0, min(width, x0)),
+        max(0, min(height, y0)),
+        max(0, min(width, x1)),
+        max(0, min(height, y1)),
+    )
+
+
+def _crop_or_pad(
+    value: np.ndarray,
+    source_box: tuple[int, int, int, int],
+    target_box: tuple[int, int, int, int],
+    canvas_size: tuple[int, int],
+) -> np.ndarray:
+    """Extract ``target_box`` from a value known over ``source_box``.
+
+    Missing strips come from edge replication, which is exactly how the
+    box blur pads the canvas border.
+    """
+    width, height = canvas_size
+    sx0, sy0, sx1, sy1 = source_box
+    tx0, ty0, tx1, ty1 = target_box
+    channels = value.shape[2:]
+    result = np.empty((ty1 - ty0, tx1 - tx0) + channels, dtype=np.float32)
+    for row in range(ty0, ty1):
+        source_row = min(max(row, sy0), sy1 - 1)
+        for col in range(tx0, tx1):
+            source_col = min(max(col, sx0), sx1 - 1)
+            result[row - ty0, col - tx0] = value[
+                source_row - sy0, source_col - sx0
+            ]
+    return result
+
+
+def _exact_crop(
+    value: np.ndarray,
+    source_box: tuple[int, int, int, int],
+    target_box: tuple[int, int, int, int],
+) -> np.ndarray:
+    sx0, sy0, sx1, sy1 = source_box
+    tx0, ty0, tx1, ty1 = target_box
+    return value[
+        ty0 - sy0 : ty1 - sy0,
+        tx0 - sx0 : tx1 - sx0,
+    ].copy()
+
+
+def evaluate_region(
+    engine: "TextureEngine",
+    output_node: str,
+    region: tuple[int, int, int, int],
+    context: RenderContext | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    time: float | None = None,
+    scope: dict[str, object] | None = None,
+    overrides: dict[str, dict[str, object]] | None = None,
+) -> np.ndarray:
+    """Windowed evaluation with exact cross-boundary neighbourhood halos.
+
+    The requested region is dilated upstream through every neighbourhood
+    node (using its current parameter-derived radius) before any node runs,
+    so blur output at a region edge averages the full (2r+1)x(2r+1)
+    neighbourhood, matching a full-canvas recompute pixel for pixel.
+    """
+    graph = engine.graph
+    overrides = overrides or {}
+    if overrides:
+        graph = copy.deepcopy(graph)
+        for node_id, params in overrides.items():
+            if node_id not in graph.nodes:
+                raise GraphValidationError(f"override for unknown node: {node_id}")
+            for name, value in params.items():
+                graph.set_param(node_id, name, value)
+    region_engine = TextureEngine(graph, engine.cache)
+
+    context = context or RenderContext()
+    if time is not None:
+        context.time = time
+    pixel_width = int(graph.width if width is None else width)
+    pixel_height = int(graph.height if height is None else height)
+    if pixel_width <= 0 or pixel_height <= 0:
+        raise GraphValidationError("width and height must be positive")
+    x0, y0, x1, y1 = _clip_box(
+        (int(region[0]), int(region[1]), int(region[2]), int(region[3])),
+        pixel_width,
+        pixel_height,
+    )
+    if x1 <= x0 or y1 <= y0:
+        raise GraphValidationError("region must contain at least one pixel")
+
+    order = graph.topological_order(output_node)
+    signatures = region_engine._signatures(
+        order, pixel_width, pixel_height, context.time
+    )
+
+    # Back-propagate the needed window from output to sources.  Each
+    # neighbourhood node dilates by its radius (clamped to the canvas); each
+    # pointwise node passes the same window on to every input.
+    windows: dict[str, tuple[int, int, int, int]] = {output_node: (x0, y0, x1, y1)}
+    pending = [output_node]
+    while pending:
+        node_id = pending.pop()
+        box = windows[node_id]
+        node = graph.nodes[node_id]
+        node_type = NODE_TYPES[node.type]
+        params = graph.params_at(node_id, context.time)
+        radius = neighborhood_radius(node.type, params)
+        needed = _clip_box(
+            (box[0] - radius, box[1] - radius, box[2] + radius, box[3] + radius),
+            pixel_width,
+            pixel_height,
+        )
+        for connection in graph.inputs_for(node_id).values():
+            source = connection.source_node
+            if source in windows:
+                old = windows[source]
+                merged = (
+                    min(old[0], needed[0]),
+                    min(old[1], needed[1]),
+                    max(old[2], needed[2]),
+                    max(old[3], needed[3]),
+                )
+                windows[source] = merged
+            else:
+                windows[source] = needed
+                pending.append(source)
+
+    values: dict[str, np.ndarray] = {}
+    boxes: dict[str, tuple[int, int, int, int]] = {}
+    for node_id in order:
+        context.raise_if_cancelled()
+        box = windows[node_id]
+        signature = signatures[node_id]
+        node = graph.nodes[node_id]
+        node_type = NODE_TYPES[node.type]
+        params = graph.params_at(node_id, context.time)
+        cached = scope.get(signature) if scope is not None else None
+        source_kind = "scope"
+        if cached is None:
+            cached = region_engine.cache.get(signature)
+            source_kind = "cache"
+        if cached is not None and tuple(np.asarray(cached).shape[:2]) == (
+            pixel_height,
+            pixel_width,
+        ):
+            full = np.asarray(cached, dtype=np.float32)
+            values[node_id] = full[box[1]:box[3], box[0]:box[2]].copy()
+            boxes[node_id] = box
+            context.cache_hits.append(node_id)
+            if scope is not None:
+                scope[signature] = cached
+            continue
+
+        inputs = {}
+        for port in node_type.inputs:
+            connection = graph.inputs_for(node_id).get(port.name)
+            if connection is None:
+                if port.required:
+                    raise GraphValidationError(
+                        f"node {node_id} is missing required input {port.name}"
+                    )
+                continue
+            source_node = connection.source_node
+            inputs[port.name] = _exact_crop(
+                values[source_node], boxes[source_node], box
+            )
+
+        value: np.ndarray
+        if node.type == "uv_coordinates":
+            xs = (np.arange(box[0], box[2], dtype=np.float32) + 0.5) / pixel_width * 2.0 - 1.0
+            ys = (np.arange(box[1], box[3], dtype=np.float32) + 0.5) / pixel_height * 2.0 - 1.0
+            xx, yy = np.meshgrid(xs, ys)
+            value = np.stack([xx, yy], axis=-1).astype(np.float32)
+        elif node.type == "solid_color":
+            value = node_type.execute(inputs, params, box[2] - box[0], box[3] - box[1])
+        elif node.type == "transform_coordinates":
+            # Pointwise remap; the already-fetched input window equals this
+            # node's window, so the generic execution path is exact.
+            value = node_type.execute(
+                inputs, params, box[2] - box[0], box[3] - box[1]
+            )
+        elif node.type == "box_blur":
+            radius = neighborhood_radius(node.type, params)
+            source_node = graph.inputs_for(node_id)["image"].source_node
+            dilated = _clip_box(
+                (
+                    box[0] - radius,
+                    box[1] - radius,
+                    box[2] + radius,
+                    box[3] + radius,
+                ),
+                pixel_width,
+                pixel_height,
+            )
+            padded = _crop_or_pad(
+                values[source_node],
+                boxes[source_node],
+                dilated,
+                (pixel_width, pixel_height),
+            )
+            blurred = _neighborhood_box(padded, radius)
+            value = blurred[
+                box[1] - dilated[1] : box[3] - dilated[1],
+                box[0] - dilated[0] : box[2] - dilated[0],
+            ].astype(np.float32)
+        else:
+            value = node_type.execute(
+                inputs, params, box[2] - box[0], box[3] - box[1]
+            )
+        expected = expected_output_shape(
+            node_type.output_type, box[2] - box[0], box[3] - box[1]
+        )
+        if tuple(value.shape) != expected:
+            raise GraphValidationError(
+                f"node {node_id} returned shape {tuple(value.shape)}, expected {expected}"
+            )
+        values[node_id] = np.asarray(value, dtype=np.float32)
+        boxes[node_id] = box
+        context.evaluated.append(node_id)
+
+    return values[output_node]
 
 
 def expected_output_shape(output_type: str, width: int, height: int) -> tuple[int, ...]:
