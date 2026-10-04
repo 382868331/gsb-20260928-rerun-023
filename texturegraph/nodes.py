@@ -216,6 +216,42 @@ def box_blur(inputs, params, width, height):
     return _neighborhood_box(np.asarray(image, dtype=np.float32), radius)
 
 
+def crop_box(
+    values: NDArray[np.float32],
+    source_box: "tuple[int, int, int, int]",
+    wanted_box: "tuple[int, int, int, int]",
+) -> NDArray[np.float32]:
+    """Slice a stored crop (located at ``source_box`` on the canvas) to ``wanted_box``."""
+    top, left, bottom, right = wanted_box
+    src_top, src_left, _, _ = source_box
+    row0, row1 = top - src_top, bottom - src_top
+    col0, col1 = left - src_left, right - src_left
+    if row0 < 0 or col0 < 0 or row1 > values.shape[0] or col1 > values.shape[1]:
+        raise ValueError("requested crop extends beyond the available window")
+    return values[row0:row1, col0:col1]
+
+
+def box_blur_window(
+    image_crop: NDArray[np.float32],
+    params: dict[str, Any],
+    output_box: "tuple[int, int, int, int]",
+    crop_origin: "tuple[int, int]",
+) -> NDArray[np.float32]:
+    """Blur a crop that already contains the full halo for ``output_box``.
+
+    Edge-replication padding here only ever feeds halo pixels that are sliced
+    off again (or genuine canvas borders), so every published output pixel
+    sees its complete real neighbourhood.
+    """
+    radius = max(0, int(round(float(params.get("radius", 1)))))
+    blurred = _neighborhood_box(np.asarray(image_crop, dtype=np.float32), radius)
+    out_top, out_left, out_bottom, out_right = output_box
+    crop_top, crop_left = crop_origin
+    row0 = out_top - crop_top
+    col0 = out_left - crop_left
+    return blurred[row0 : row0 + (out_bottom - out_top), col0 : col0 + (out_right - out_left)]
+
+
 NODE_TYPES["box_blur"] = NodeType(
     "box_blur",
     (Port("image", "image"),),
