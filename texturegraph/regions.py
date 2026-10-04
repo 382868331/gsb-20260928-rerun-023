@@ -143,6 +143,8 @@ class Candidate:
     tile_path: str
     meta_path: str
     full_digest_match: bool
+    output_signature: str = ""
+    node_signatures: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -164,6 +166,8 @@ class Candidate:
             "tile_path": self.tile_path,
             "meta_path": self.meta_path,
             "full_digest_match": self.full_digest_match,
+            "output_signature": self.output_signature,
+            "node_signatures": dict(sorted(self.node_signatures.items())),
         }
 
     @classmethod
@@ -189,6 +193,8 @@ class Candidate:
             tile_path=document["tile_path"],
             meta_path=document["meta_path"],
             full_digest_match=bool(document.get("full_digest_match", False)),
+            output_signature=document.get("output_signature", ""),
+            node_signatures=dict(document.get("node_signatures", {})),
         )
 
     def tile_intact(self) -> bool:
@@ -496,7 +502,9 @@ class RegionWorkspace:
         """Compute a local candidate and verify it against a full recompute.
 
         The candidate tile is stored separately; nothing published changes
-        until ``adopt_candidate`` is called.  Cross-boundary blur halos are
+        until ``adopt_candidate`` is called.  Multiple candidates may cover
+        the same rectangle — overlapping plans coexist and are only
+        disambiguated at adoption time.  Cross-boundary blur halos are
         included by the windowed evaluator, and the tile is compared pixel
         by pixel with a full-canvas recompute under the same overrides.
         """
@@ -507,17 +515,6 @@ class RegionWorkspace:
                 f"target {target.node_id} must be published before creating candidates"
             )
         region = self._validated_region(region, target)
-        overlapping = sorted(
-            other.id
-            for other in self.candidates.values()
-            if other.target.key() == target.key()
-            and other.region.intersects(region)
-        )
-        if overlapping:
-            raise ValueError(
-                "candidate overlaps pending candidate(s) that must be chosen "
-                f"or cancelled explicitly: {', '.join(overlapping)}"
-            )
         overrides = {node_id: dict(params) for node_id, params in overrides.items()}
         engine, signatures, _ = self._node_signatures(target, overrides)
         signature = self._candidate_signature(target, region, overrides, signatures)
@@ -585,6 +582,8 @@ class RegionWorkspace:
             tile_path=tile_path,
             meta_path=meta_path,
             full_digest_match=match,
+            output_signature=signatures[target.node_id],
+            node_signatures=dict(sorted(signatures.items())),
         )
         _write_json(meta_path, candidate.to_dict())
         self.candidates[candidate_id] = candidate
@@ -601,6 +600,208 @@ class RegionWorkspace:
             except FileNotFoundError:
                 pass
 
+    def list_candidates(
+        self, target: RegionTarget | None = None
+    ) -> list[Candidate]:
+        """Return pending candidates, optionally restricted to one target.
+
+        Overlapping plans coexist, so the list is not deduplicated by
+        region and registration order carries no precedence.
+        """
+        return [
+            candidate
+            for candidate in self.candidates.values()
+            if target is None or candidate.target.key() == target.key()
+        ]
+
+    def _candidate_pixels(self, candidate: Candidate) -> np.ndarray | None:
+        if not candidate.tile_intact():
+            return None
+        return _read_png(candidate.tile_path)
+
+    def _pixel_diff(
+        self, a: np.ndarray, b: np.ndarray
+    ) -> dict[str, object]:
+        delta = np.abs(
+            a.astype(np.int16) - b.astype(np.int16)
+        )
+        changed = np.count_nonzero(np.any(delta > 0, axis=-1))
+        return {
+            "pixels": int(a.shape[0] * a.shape[1]),
+            "changed_pixels": int(changed),
+            "max_abs": int(delta.max()),
+            "mean_abs": float(delta.mean()),
+        }
+
+    def compare_candidates(
+        self, target: RegionTarget
+    ) -> dict[str, object]:
+        """Present every pending plan for a target side by side.
+
+        Each entry reports the candidate's parameters, the per-node input
+        version signatures captured at registration, tile validity and the
+        pixel difference against the currently published canvas inside the
+        candidate rectangle.  Pairwise differences over the shared overlap
+        are included so two plans covering the same area can be compared
+        directly; nothing here resolves or orders a conflict.
+        """
+        candidates = sorted(
+            (
+                candidate
+                for candidate in self.candidates.values()
+                if candidate.target.key() == target.key()
+            ),
+            key=lambda candidate: candidate.id,
+        )
+        published = self.read_published(target)
+        entries: list[dict[str, object]] = []
+        tiles: dict[str, np.ndarray] = {}
+        for candidate in candidates:
+            tile = self._candidate_pixels(candidate)
+            entry: dict[str, object] = {
+                "id": candidate.id,
+                "region": candidate.region.as_list(),
+                "overrides": {
+                    node_id: dict(params)
+                    for node_id, params in candidate.overrides.items()
+                },
+                "input_version": candidate.output_signature,
+                "node_signatures": dict(candidate.node_signatures),
+                "signature": candidate.signature,
+                "intact": tile is not None,
+                "full_digest_match": candidate.full_digest_match,
+                "diff_vs_published": None,
+                "overlap_diffs": {},
+            }
+            if tile is not None:
+                tiles[candidate.id] = tile
+                if published is not None:
+                    published_tile = published[
+                        candidate.region.y0 : candidate.region.y1,
+                        candidate.region.x0 : candidate.region.x1,
+                    ]
+                    entry["diff_vs_published"] = self._pixel_diff(
+                        tile, published_tile
+                    )
+            entries.append(entry)
+        for index, candidate in enumerate(candidates):
+            entry = entries[index]
+            for other in candidates[index + 1 :]:
+                region = candidate.region
+                other_region = other.region
+                if not region.intersects(other_region):
+                    continue
+                tile_a = tiles.get(candidate.id)
+                tile_b = tiles.get(other.id)
+                if tile_a is None or tile_b is None:
+                    continue
+                ax0 = max(region.x0, other_region.x0) - region.x0
+                ay0 = max(region.y0, other_region.y0) - region.y0
+                ax1 = min(region.x1, other_region.x1) - region.x0
+                ay1 = min(region.y1, other_region.y1) - region.y0
+                bx0 = max(region.x0, other_region.x0) - other_region.x0
+                by0 = max(region.y0, other_region.y0) - other_region.y0
+                bx1 = min(region.x1, other_region.x1) - other_region.x0
+                by1 = min(region.y1, other_region.y1) - other_region.y0
+                diff = self._pixel_diff(
+                    tile_a[ay0:ay1, ax0:ax1],
+                    tile_b[by0:by1, bx0:bx1],
+                )
+                entry["overlap_diffs"][other.id] = diff
+                for other_entry in entries:
+                    if other_entry["id"] == other.id:
+                        other_entry["overlap_diffs"][candidate.id] = diff
+                        break
+        return {"target": target.node_id, "candidates": entries}
+
+    def revalidate_candidate(
+        self,
+        candidate_id: str,
+        is_cancelled: Callable[[], bool] = lambda: False,
+    ) -> dict[str, object]:
+        """Recompute one pending plan after an input change or tile damage.
+
+        Only the named candidate is touched; every other pending choice
+        (including overlapping plans for the same region) is preserved.
+        Returns a report describing whether inputs changed, whether the
+        stored tile was damaged, and the new pixel digest after the plan
+        was recomputed and re-verified against a full-canvas render.
+        """
+        candidate = self.candidates.get(candidate_id)
+        if candidate is None:
+            raise KeyError(f"no such candidate: {candidate_id}")
+        target = candidate.target
+        region = self._validated_region(candidate.region, target)
+        overrides = {
+            node_id: dict(params)
+            for node_id, params in candidate.overrides.items()
+        }
+        engine, signatures, _ = self._node_signatures(target, overrides)
+        new_signature = self._candidate_signature(
+            target, region, overrides, signatures
+        )
+        inputs_changed = new_signature != candidate.signature
+        tile_intact = candidate.tile_intact()
+        report: dict[str, object] = {
+            "id": candidate_id,
+            "inputs_changed": inputs_changed,
+            "tile_damaged": not tile_intact,
+            "recomputed": False,
+        }
+        if not inputs_changed and tile_intact:
+            candidate.full_digest_match = True
+            report["content_digest"] = candidate.content_digest
+            return report
+
+        context = RenderContext(is_cancelled=is_cancelled, time=target.time)
+        local_value = engine.evaluate_region(
+            target.node_id,
+            region.tuple,
+            context=context,
+            width=target.width,
+            height=target.height,
+            time=target.time,
+            overrides=overrides,
+        )
+        context.raise_if_cancelled()
+        full_value = engine.evaluate(
+            target.node_id,
+            RenderContext(is_cancelled=is_cancelled, time=target.time),
+            target.width,
+            target.height,
+            target.time,
+        )
+        full_tile = _to_uint8(
+            full_value[region.y0 : region.y1, region.x0 : region.x1]
+        )
+        tile = _to_uint8(local_value)
+        match = bool(np.array_equal(tile, full_tile))
+        if not match:
+            raise RenderCancelled(
+                "region candidate does not match full recompute pixel by pixel"
+            )
+        digest = image_digest(tile)
+        _write_png(
+            tile,
+            candidate.tile_path,
+            {
+                "Region-Candidate": candidate.id,
+                "Region-Candidate-Signature": new_signature,
+                "Region-Candidate-Content-SHA256": digest,
+            },
+        )
+        candidate.region = region
+        candidate.overrides = overrides
+        candidate.signature = new_signature
+        candidate.content_digest = digest
+        candidate.full_digest_match = True
+        candidate.output_signature = signatures[target.node_id]
+        candidate.node_signatures = dict(sorted(signatures.items()))
+        _write_json(candidate.meta_path, candidate.to_dict())
+        report["recomputed"] = True
+        report["content_digest"] = digest
+        return report
+
     def adopt_candidate(
         self,
         candidate_id: str,
@@ -609,10 +810,12 @@ class RegionWorkspace:
     ) -> AdoptedTile:
         """Publish a new version containing exactly one candidate region.
 
-        Overlapping adopted regions are rejected unless ``replace`` is set,
-        in which case the earlier tiles are dropped from the new version.
-        Pending candidates overlapping the adopted rectangle must be
-        cancelled or adopted explicitly first.
+        Overlapping pending candidates and overlapping already-adopted
+        regions both require an explicit choice: conflicting pending
+        candidates must be cancelled (or adopted with ``replace=True``)
+        first, and conflicting adopted regions need ``replace=True``.
+        Merely adjacent pending candidates are left untouched and can be
+        adopted afterwards; registration order never decides a conflict.
         """
         candidate = self.candidates.get(candidate_id)
         if candidate is None:
@@ -626,17 +829,18 @@ class RegionWorkspace:
         if current_version is None:
             raise GraphValidationError("target baseline is missing")
 
-        pending_others = sorted(
+        pending_overlaps = sorted(
             other.id
             for other in self.candidates.values()
             if other.id != candidate.id
             and other.target.key() == target.key()
+            and other.region.intersects(candidate.region)
         )
-        if pending_others:
+        if pending_overlaps:
             raise ValueError(
-                "other pending candidate(s) for the same target must be "
+                "pending candidate(s) overlap this region and must be "
                 "chosen or cancelled explicitly first: "
-                f"{', '.join(pending_others)}"
+                f"{', '.join(pending_overlaps)}"
             )
 
         active = [
@@ -907,6 +1111,7 @@ class RegionWorkspace:
             "changed_nodes": [],
             "damaged": False,
             "affected_tiles": [],
+            "revalidated_candidates": [],
             "recomputed": False,
         }
         if version is None:
@@ -968,7 +1173,7 @@ class RegionWorkspace:
             damaged_tiles = {
                 tile for tile in active_tiles if not self._adopted_tile_pixels_intact(tile, target)
             }
-            return self._rebuild_target(
+            rebuilt = self._rebuild_target(
                 target,
                 engine,
                 current_signatures,
@@ -978,9 +1183,16 @@ class RegionWorkspace:
                 is_cancelled,
                 full_rebuild=True,
             )
+            self._recover_pending_candidates(
+                target, current_signatures, report, is_cancelled
+            )
+            return rebuilt
         if not affected:
+            self._recover_pending_candidates(
+                target, current_signatures, report, is_cancelled
+            )
             return report
-        return self._rebuild_target(
+        rebuilt = self._rebuild_target(
             target,
             engine,
             current_signatures,
@@ -989,6 +1201,44 @@ class RegionWorkspace:
             report,
             is_cancelled,
         )
+        self._recover_pending_candidates(
+            target, current_signatures, report, is_cancelled
+        )
+        return rebuilt
+
+    def _recover_pending_candidates(
+        self,
+        target: RegionTarget,
+        current_signatures: dict[str, str],
+        report: dict,
+        is_cancelled: Callable[[], bool],
+    ) -> None:
+        """Re-verify pending plans for this target, keeping every other one.
+
+        A candidate is revalidated when its stored tile is damaged or when
+        any of its captured per-node input signatures no longer matches the
+        current graph.  Candidates for other targets are never touched.
+        """
+        for candidate in list(self.candidates.values()):
+            if candidate.target.key() != target.key():
+                continue
+            stale_inputs = any(
+                candidate.node_signatures.get(node_id) != signature
+                for node_id, signature in current_signatures.items()
+                if node_id in candidate.node_signatures
+            )
+            if stale_inputs or not candidate.tile_intact():
+                candidate_report = self.revalidate_candidate(
+                    candidate.id, is_cancelled=is_cancelled
+                )
+                report["revalidated_candidates"].append(
+                    {
+                        "id": candidate.id,
+                        "inputs_changed": candidate_report["inputs_changed"],
+                        "tile_damaged": candidate_report["tile_damaged"],
+                        "recomputed": candidate_report["recomputed"],
+                    }
+                )
 
     def _nodes_influencing_region(
         self,

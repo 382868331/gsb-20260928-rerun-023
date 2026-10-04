@@ -121,7 +121,7 @@ def test_adopting_one_of_two_adjacent_candidates_keeps_other_region(tmp_path):
     )
 
 
-def test_overlapping_candidates_must_be_chosen_or_cancelled(tmp_path):
+def test_adjacent_pending_candidates_can_be_adopted_in_either_order(tmp_path):
     graph = _pattern_graph()
     workspace = _workspace(tmp_path, graph)
     target = RegionTarget("out", 64, 64)
@@ -129,24 +129,231 @@ def test_overlapping_candidates_must_be_chosen_or_cancelled(tmp_path):
     workspace.create_candidate("left", target, LEFT, LEFT_OVERRIDES)
     workspace.create_candidate("right", target, RIGHT, RIGHT_OVERRIDES)
 
-    with pytest.raises(ValueError, match="cancelled explicitly"):
-        workspace.adopt_candidate("left")
+    # Adjacent pending candidates are not a conflict; the second simply
+    # stays pending while the first is adopted in a new version.
+    first = workspace.adopt_candidate("left")
+    assert first.published_version == 2
+    assert "right" in workspace.candidates
+    second = workspace.adopt_candidate("right")
+    assert second.published_version == 3
+    assert not workspace.candidates
 
-    # Cancelling one is an explicit choice.
-    workspace.cancel_candidate("right")
-    workspace.adopt_candidate("left")
+    full = _full_png(graph, target)
+    full_left = _full_png(graph, target, LEFT_OVERRIDES)
+    full_right = _full_png(graph, target, RIGHT_OVERRIDES)
+    pixels = np.asarray(
+        Image.open(workspace.published_path(target)).convert("RGBA")
+    )
+    assert np.array_equal(np.asarray(pixels)[:, :32], full_left[:, :32])
+    assert np.array_equal(np.asarray(pixels)[:, 32:], full_right[:, 32:])
+    assert not np.array_equal(np.asarray(pixels), full)
 
-    workspace.create_candidate("right2", target, RIGHT, RIGHT_OVERRIDES)
-    # Adopted regions are adjacent (not overlapping) here, so adopting is fine.
-    workspace.adopt_candidate("right2")
 
+def test_overlapping_pending_candidates_require_explicit_choice(tmp_path):
+    graph = _pattern_graph()
+    workspace = _workspace(tmp_path, graph)
+    target = RegionTarget("out", 64, 64)
+    workspace.publish(target)
+    workspace.create_candidate("left", target, LEFT, LEFT_OVERRIDES)
     workspace.create_candidate(
         "over", target, Region(16, 0, 48, 64), {"blur": {"radius": 2}}
     )
-    with pytest.raises(ValueError, match="overlaps adopted"):
+
+    # Registration allows the overlap; only adopting forces a decision.
+    assert set(workspace.candidates) == {"left", "over"}
+    with pytest.raises(ValueError, match="cancelled explicitly"):
+        workspace.adopt_candidate("left")
+    with pytest.raises(ValueError, match="cancelled explicitly"):
         workspace.adopt_candidate("over")
-    replaced = workspace.adopt_candidate("over", replace=True)
-    assert replaced.published_version == 4
+
+    # Picking either side explicitly is fine; order decides nothing.
+    workspace.cancel_candidate("left")
+    adopted = workspace.adopt_candidate("over")
+    assert adopted.published_version == 2
+
+    workspace.create_candidate("left2", target, LEFT, LEFT_OVERRIDES)
+    with pytest.raises(ValueError, match="overlaps adopted"):
+        workspace.adopt_candidate("left2")
+    replaced = workspace.adopt_candidate("left2", replace=True)
+    assert replaced.published_version == 3
+
+
+def test_overlapping_candidates_are_listed_with_params_versions_and_diffs(tmp_path):
+    graph = _pattern_graph()
+    workspace = _workspace(tmp_path, graph)
+    target = RegionTarget("out", 64, 64)
+    workspace.publish(target)
+    workspace.create_candidate("left", target, LEFT, LEFT_OVERRIDES)
+    workspace.create_candidate("left2", target, Region(0, 0, 40, 64), {
+        "m": {"radius": 0.35},
+    })
+
+    comparison = workspace.compare_candidates(target)
+    entries = {entry["id"]: entry for entry in comparison["candidates"]}
+    assert set(entries) == {"left", "left2"}
+    assert entries["left"]["overrides"] == LEFT_OVERRIDES
+    assert entries["left2"]["overrides"] == {"m": {"radius": 0.35}}
+    assert entries["left"]["input_version"]
+    assert entries["left"]["input_version"] != entries["left2"]["input_version"]
+    assert "out" in entries["left"]["node_signatures"]
+    assert entries["left"]["diff_vs_published"]["pixels"] == 32 * 64
+    assert entries["left2"]["diff_vs_published"]["pixels"] == 40 * 64
+    overlap = entries["left"]["overlap_diffs"]["left2"]
+    assert overlap["pixels"] == 32 * 64
+    assert entries["left2"]["overlap_diffs"]["left"] == overlap
+
+
+def test_non_square_canvas_overlapping_candidates_keep_full_blur_halo(tmp_path):
+    width, height = 96, 48
+    graph = _pattern_graph(width=width, height=height)
+    workspace = _workspace(tmp_path, graph)
+    target = RegionTarget("out", width, height)
+    workspace.publish(target)
+    region_a = Region(0, 0, 60, height)
+    region_b = Region(40, 0, width, height)
+    workspace.create_candidate("a", target, region_a, LEFT_OVERRIDES)
+    workspace.create_candidate("b", target, region_b, RIGHT_OVERRIDES)
+
+    full_a = _full_png(graph, target, LEFT_OVERRIDES)
+    full_b = _full_png(graph, target, RIGHT_OVERRIDES)
+    tile_a = np.asarray(
+        Image.open(workspace.candidates["a"].tile_path).convert("RGBA")
+    )
+    tile_b = np.asarray(
+        Image.open(workspace.candidates["b"].tile_path).convert("RGBA")
+    )
+    # Each tile matches the full recompute, including the seam columns
+    # where the box blur reads pixels on both sides of the boundary.
+    assert np.array_equal(tile_a, full_a[:, :60])
+    assert np.array_equal(tile_b, full_b[:, 40:])
+
+    with pytest.raises(ValueError, match="cancelled explicitly"):
+        workspace.adopt_candidate("a")
+    workspace.cancel_candidate("b")
+    workspace.adopt_candidate("a")
+    published = np.asarray(
+        Image.open(workspace.published_path(target)).convert("RGBA")
+    )
+    baseline = np.asarray(
+        Image.open(
+            workspace._published_path(target, 1)
+        ).convert("RGBA")
+    )
+    assert np.array_equal(np.asarray(published)[:, :60], full_a[:, :60])
+    # The unchosen side keeps the original published pixels.
+    assert np.array_equal(np.asarray(published)[:, 60:], baseline[:, 60:])
+
+
+def test_pending_overlap_survives_save_resume_and_only_chosen_is_adopted(tmp_path):
+    root = str(tmp_path / "regions")
+    graph = _pattern_graph()
+    cache = EvaluationCache()
+    workspace = RegionWorkspace(root, graph, cache)
+    target = RegionTarget("out", 64, 64)
+    workspace.publish(target)
+    workspace.create_candidate("left", target, LEFT, LEFT_OVERRIDES)
+    workspace.create_candidate(
+        "over", target, Region(16, 0, 48, 64), {"blur": {"radius": 2}}
+    )
+    workspace.save_state()
+
+    resumed = RegionWorkspace.open(root, graph, cache)
+    assert set(resumed.candidates) == {"left", "over"}
+    comparison = resumed.compare_candidates(target)
+    assert {
+        entry["id"] for entry in comparison["candidates"]
+    } == {"left", "over"}
+    with pytest.raises(ValueError, match="cancelled explicitly"):
+        resumed.adopt_candidate("over")
+    resumed.cancel_candidate("over")
+    adopted = resumed.adopt_candidate("left")
+    assert adopted.published_version == 2
+
+
+def test_revalidate_candidate_after_input_change_keeps_other_pending(tmp_path):
+    root = str(tmp_path / "regions")
+    graph = _pattern_graph()
+    cache = EvaluationCache()
+    workspace = RegionWorkspace(root, graph, cache)
+    target = RegionTarget("out", 64, 64)
+    workspace.publish(target)
+    workspace.create_candidate("left", target, LEFT, LEFT_OVERRIDES)
+    workspace.create_candidate(
+        "over", target, Region(16, 0, 48, 64), {"blur": {"radius": 2}}
+    )
+    workspace.save_state()
+    old_over_digest = workspace.candidates["over"].content_digest
+    old_over_signature = workspace.candidates["over"].signature
+
+    # Shared input change: pat_fg colour feeds the whole output.
+    graph.set_param("pat_fg", "color", [0.2, 0.9, 0.3, 1.0])
+    resumed = RegionWorkspace.open(root, graph, cache)
+    report = resumed.revalidate_candidate("left")
+    assert report["inputs_changed"] is True
+    assert report["recomputed"] is True
+
+    # The overlapping sibling is still pending with its original plan.
+    assert "over" in resumed.candidates
+    over = resumed.candidates["over"]
+    assert over.content_digest == old_over_digest
+    assert over.signature == old_over_signature
+    left = resumed.candidates["left"]
+    assert left.tile_intact() is True
+    expected = _full_png(graph, target, LEFT_OVERRIDES)
+    tile = np.asarray(Image.open(left.tile_path).convert("RGBA"))
+    assert np.array_equal(np.asarray(tile), expected[:, :32])
+
+    # Adopting still demands an explicit choice for the overlap.
+    with pytest.raises(ValueError, match="cancelled explicitly"):
+        resumed.adopt_candidate("left")
+
+
+def test_revalidate_candidate_after_tile_corruption_keeps_other_pending(tmp_path):
+    root = str(tmp_path / "regions")
+    graph = _pattern_graph()
+    cache = EvaluationCache()
+    workspace = RegionWorkspace(root, graph, cache)
+    target = RegionTarget("out", 64, 64)
+    workspace.publish(target)
+    workspace.create_candidate("left", target, LEFT, LEFT_OVERRIDES)
+    workspace.create_candidate(
+        "over", target, Region(16, 0, 48, 64), {"blur": {"radius": 2}}
+    )
+    workspace.save_state()
+    with open(workspace.candidates["left"].tile_path, "r+b") as handle:
+        handle.seek(120)
+        handle.write(b"\x00" * 20)
+
+    resumed = RegionWorkspace.open(root, graph, cache)
+    report = resumed.revalidate_candidate("left")
+    assert report["inputs_changed"] is False
+    assert report["tile_damaged"] is True
+    assert report["recomputed"] is True
+    assert resumed.candidates["left"].tile_intact() is True
+    assert resumed.candidates["over"].tile_intact() is True
+
+
+def test_recover_target_revalidates_pending_candidates_only(tmp_path):
+    root = str(tmp_path / "regions")
+    graph = _pattern_graph()
+    cache = EvaluationCache()
+    workspace = RegionWorkspace(root, graph, cache)
+    target = RegionTarget("out", 64, 64)
+    workspace.publish(target)
+    workspace.create_candidate("left", target, LEFT, LEFT_OVERRIDES)
+    workspace.save_state()
+
+    graph.set_param("pat_fg", "color", [0.2, 0.9, 0.3, 1.0])
+    resumed = RegionWorkspace.open(root, graph, cache)
+    report = resumed.recover_target(target)
+    assert [item["id"] for item in report["revalidated_candidates"]] == ["left"]
+    assert report["revalidated_candidates"][0]["inputs_changed"] is True
+    assert "left" in resumed.candidates
+    expected = _full_png(graph, target, LEFT_OVERRIDES)
+    tile = np.asarray(
+        Image.open(resumed.candidates["left"].tile_path).convert("RGBA")
+    )
+    assert np.array_equal(np.asarray(tile), expected[:, :32])
 
 
 def test_republish_without_changes_is_a_noop(tmp_path):
