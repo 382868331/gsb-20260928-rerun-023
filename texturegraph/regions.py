@@ -22,6 +22,7 @@ from .engine import (
 )
 from .errors import GraphValidationError, RenderCancelled
 from .graph import Graph
+from .nodes import neighborhood_radius
 
 REGION_STATE_VERSION = 1
 
@@ -45,6 +46,28 @@ class Region:
             and other.x0 < self.x1
             and self.y0 < other.y1
             and other.y0 < self.y1
+        )
+
+    @property
+    def area(self) -> int:
+        return (self.x1 - self.x0) * (self.y1 - self.y0)
+
+    def intersection(self, other: "Region") -> "Region | None":
+        if not self.intersects(other):
+            return None
+        return Region(
+            max(self.x0, other.x0),
+            max(self.y0, other.y0),
+            min(self.x1, other.x1),
+            min(self.y1, other.y1),
+        )
+
+    def dilated(self, radius: int, width: int, height: int) -> "Region":
+        return Region(
+            max(0, self.x0 - radius),
+            max(0, self.y0 - radius),
+            min(width, self.x1 + radius),
+            min(height, self.y1 + radius),
         )
 
     def as_list(self) -> list[int]:
@@ -713,6 +736,343 @@ class RegionWorkspace:
                         other_entry["overlap_diffs"][candidate.id] = diff
                         break
         return {"target": target.node_id, "candidates": entries}
+
+    # ------------------------------------------------------------------
+    # dependency-closure combinations
+    # ------------------------------------------------------------------
+
+    def _read_region(
+        self,
+        target: RegionTarget,
+        region: Region,
+        overrides: dict[str, dict[str, object]],
+    ) -> Region:
+        """Canvas pixels whose values can influence the candidate's region.
+
+        The write rectangle is dilated by the accumulated neighbourhood
+        radius along every upstream path (box_blur halos stack through the
+        chain), using the candidate's own overrides for the radii.  This
+        is the same back-propagation the windowed evaluator performs, so a
+        second candidate writing inside this window would change what the
+        first candidate's verified pixels were computed from — a genuine
+        dependency even when the write rectangles never touch.
+        """
+        graph = self.graph
+        if overrides:
+            graph = copy.deepcopy(self.graph)
+            for node_id, params in overrides.items():
+                if node_id not in graph.nodes:
+                    raise GraphValidationError(
+                        f"override for unknown node: {node_id}"
+                    )
+                for name, value in params.items():
+                    graph.set_param(node_id, name, value)
+        order = graph.topological_order(target.node_id)
+        radius_at: dict[str, int] = {}
+        for node_id in order:
+            node = graph.nodes[node_id]
+            params = graph.params_at(node_id, target.time)
+            upstream = max(
+                (
+                    radius_at[connection.source_node]
+                    for connection in graph.inputs_for(node_id).values()
+                    if connection.source_node in radius_at
+                ),
+                default=0,
+            )
+            radius_at[node_id] = upstream + neighborhood_radius(node.type, params)
+        total = radius_at[target.node_id]
+        return region.dilated(total, target.width, target.height)
+
+    def _candidate_stale(
+        self, candidate: Candidate, current_signatures: dict[str, str]
+    ) -> bool:
+        return any(
+            candidate.node_signatures.get(node_id) != signature
+            for node_id, signature in current_signatures.items()
+            if node_id in candidate.node_signatures
+        )
+
+    def plan_combinations(self, target: RegionTarget) -> dict[str, object]:
+        """Derive which pending candidates can be adopted together.
+
+        Dependencies come from actual pixel writes and neighbourhood
+        reads, not just rectangle overlap: two candidates conflict when
+        their write regions intersect, or when one's read window (write
+        region dilated by the accumulated blur radius) reaches pixels the
+        other writes.  Geometrically disjoint rectangles can therefore
+        still depend on each other across a blur halo, and that dependency
+        is reported explicitly.
+
+        The report lists per-candidate read regions and staleness (input
+        changes since registration — revalidate before adopting), every
+        dependency pair with its kind, the conflict clusters that require
+        an explicit choice, the independent candidates that can be adopted
+        on their own, and two compared plans over the maximal compatible
+        combinations: 'preserve_current' keeps the most currently
+        published pixels, 'satisfy_regions' satisfies the most requested
+        regions.  Nothing is adopted here.
+        """
+        candidates = sorted(
+            (
+                candidate
+                for candidate in self.candidates.values()
+                if candidate.target.key() == target.key()
+            ),
+            key=lambda candidate: candidate.id,
+        )
+        entries: list[dict[str, object]] = []
+        read_regions: dict[str, Region] = {}
+        stale_ids: list[str] = []
+        for candidate in candidates:
+            read_region = self._read_region(
+                target, candidate.region, candidate.overrides
+            )
+            read_regions[candidate.id] = read_region
+            _, current_signatures, _ = self._node_signatures(
+                target, candidate.overrides
+            )
+            stale = self._candidate_stale(candidate, current_signatures)
+            if stale:
+                stale_ids.append(candidate.id)
+            entries.append(
+                {
+                    "id": candidate.id,
+                    "region": candidate.region.as_list(),
+                    "read_region": read_region.as_list(),
+                    "write_pixels": candidate.region.area,
+                    "intact": candidate.tile_intact(),
+                    "inputs_changed": stale,
+                }
+            )
+
+        dependencies: list[dict[str, object]] = []
+        conflict_pairs: set[frozenset[str]] = set()
+        for index, first in enumerate(candidates):
+            for second in candidates[index + 1 :]:
+                write_overlap = first.region.intersection(second.region)
+                first_reads_second = read_regions[first.id].intersection(
+                    second.region
+                )
+                second_reads_first = read_regions[second.id].intersection(
+                    first.region
+                )
+                if write_overlap is not None:
+                    kind = "write_overlap"
+                    detail = {
+                        "region": write_overlap.as_list(),
+                        "pixels": write_overlap.area,
+                    }
+                elif first_reads_second is not None or second_reads_first is not None:
+                    kind = "read_write"
+                    detail = {}
+                    if first_reads_second is not None:
+                        detail[first.id + "_reads_" + second.id] = {
+                            "region": first_reads_second.as_list(),
+                            "pixels": first_reads_second.area,
+                        }
+                    if second_reads_first is not None:
+                        detail[second.id + "_reads_" + first.id] = {
+                            "region": second_reads_first.as_list(),
+                            "pixels": second_reads_first.area,
+                        }
+                else:
+                    continue
+                dependencies.append(
+                    {
+                        "candidates": [first.id, second.id],
+                        "kind": kind,
+                        "detail": detail,
+                    }
+                )
+                conflict_pairs.add(frozenset((first.id, second.id)))
+
+        ids = [candidate.id for candidate in candidates]
+        compatible: dict[str, set[str]] = {
+            candidate_id: set() for candidate_id in ids
+        }
+        for position, first_id in enumerate(ids):
+            for second_id in ids[position + 1 :]:
+                if frozenset((first_id, second_id)) not in conflict_pairs:
+                    compatible[first_id].add(second_id)
+                    compatible[second_id].add(first_id)
+
+        combinations: list[frozenset[str]] = []
+
+        def _grow(chosen: frozenset[str], remaining: list[str]) -> None:
+            extended = False
+            for index, candidate_id in enumerate(remaining):
+                if not chosen or chosen <= compatible[candidate_id]:
+                    extended = True
+                    _grow(
+                        chosen | {candidate_id},
+                        [
+                            other
+                            for other in remaining[index + 1 :]
+                            if other in compatible[candidate_id]
+                        ],
+                    )
+            if not extended and chosen:
+                if not any(chosen < existing for existing in combinations):
+                    combinations.append(chosen)
+
+        _grow(frozenset(), ids)
+
+        canvas_pixels = target.width * target.height
+        by_id = {candidate.id: candidate for candidate in candidates}
+
+        def _union_write_pixels(combo: frozenset[str]) -> int:
+            mask = np.zeros((target.height, target.width), dtype=bool)
+            for candidate_id in combo:
+                region = by_id[candidate_id].region
+                mask[region.y0 : region.y1, region.x0 : region.x1] = True
+            return int(mask.sum())
+
+        def _plan_entry(combo: frozenset[str]) -> dict[str, object]:
+            changed = _union_write_pixels(combo)
+            return {
+                "candidates": sorted(combo),
+                "satisfied_regions": len(combo),
+                "changed_pixels": changed,
+                "preserved_pixels": canvas_pixels - changed,
+                "stale": any(
+                    candidate_id in stale_ids for candidate_id in combo
+                ),
+            }
+
+        plans: dict[str, object] = {}
+        if combinations:
+            satisfy = max(
+                combinations,
+                key=lambda combo: (
+                    len(combo),
+                    _union_write_pixels(combo),
+                    tuple(sorted(combo)),
+                ),
+            )
+            preserve = min(
+                combinations,
+                key=lambda combo: (
+                    _union_write_pixels(combo),
+                    len(combo),
+                    tuple(sorted(combo)),
+                ),
+            )
+            plans["satisfy_regions"] = _plan_entry(satisfy)
+            plans["preserve_current"] = _plan_entry(preserve)
+
+        adjacency: dict[str, set[str]] = {candidate_id: set() for candidate_id in ids}
+        for pair in conflict_pairs:
+            first_id, second_id = sorted(pair)
+            adjacency[first_id].add(second_id)
+            adjacency[second_id].add(first_id)
+        clusters: list[list[str]] = []
+        seen: set[str] = set()
+        for candidate_id in ids:
+            if candidate_id in seen or not adjacency[candidate_id]:
+                continue
+            stack = [candidate_id]
+            cluster: list[str] = []
+            while stack:
+                current = stack.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                cluster.append(current)
+                stack.extend(adjacency[current] - seen)
+            clusters.append(sorted(cluster))
+
+        return {
+            "target": target.node_id,
+            "candidates": entries,
+            "dependencies": dependencies,
+            "conflict_clusters": clusters,
+            "independent": [
+                candidate_id
+                for candidate_id in ids
+                if not adjacency[candidate_id]
+            ],
+            "requires_revalidation": stale_ids,
+            "combinations": [
+                _plan_entry(combo)
+                for combo in sorted(
+                    combinations, key=lambda combo: tuple(sorted(combo))
+                )
+            ],
+            "plans": plans,
+        }
+
+    def adopt_combination(
+        self,
+        candidate_ids: list[str],
+        is_cancelled: Callable[[], bool] = lambda: False,
+    ) -> dict[str, object]:
+        """Adopt a verified-compatible set of candidates in one go.
+
+        The set must be dependency-closed: no write overlaps and no
+        read/write neighbourhood dependency between any two members, and
+        no stale inputs (revalidate first after the original inputs
+        changed).  Conflicting members raise and name the pair, so the
+        choice stays explicit; independent candidates can be adopted in
+        separate calls.  Each member is then adopted individually, so
+        pixels and provenance outside every chosen region are preserved
+        byte for byte.
+        """
+        members: list[Candidate] = []
+        for candidate_id in candidate_ids:
+            candidate = self.candidates.get(candidate_id)
+            if candidate is None:
+                raise KeyError(f"no such candidate: {candidate_id}")
+            members.append(candidate)
+        if not members:
+            raise ValueError("a combination must contain at least one candidate")
+        targets = {candidate.target.key() for candidate in members}
+        if len(targets) > 1:
+            raise ValueError("a combination must target a single published output")
+        target = members[0].target
+
+        read_regions = {
+            candidate.id: self._read_region(
+                target, candidate.region, candidate.overrides
+            )
+            for candidate in members
+        }
+        for index, first in enumerate(members):
+            _, current_signatures, _ = self._node_signatures(
+                target, first.overrides
+            )
+            if self._candidate_stale(first, current_signatures):
+                raise ValueError(
+                    f"candidate {first.id} inputs changed since registration; "
+                    "revalidate it before adopting"
+                )
+            if not first.tile_intact():
+                raise ValueError(
+                    f"candidate {first.id} tile is missing or damaged; recompute it"
+                )
+            for second in members[index + 1 :]:
+                if first.region.intersects(second.region):
+                    raise ValueError(
+                        f"candidates {first.id} and {second.id} write overlapping "
+                        "pixels; choose one explicitly"
+                    )
+                if read_regions[first.id].intersects(second.region) or read_regions[
+                    second.id
+                ].intersects(first.region):
+                    raise ValueError(
+                        f"candidates {first.id} and {second.id} depend on each "
+                        "other through a neighbourhood read; choose one explicitly"
+                    )
+
+        adopted = [
+            self.adopt_candidate(candidate.id, is_cancelled=is_cancelled)
+            for candidate in members
+        ]
+        return {
+            "target": target.node_id,
+            "adopted": [tile.candidate_id for tile in adopted],
+            "version": self._current_version(target),
+        }
 
     def revalidate_candidate(
         self,

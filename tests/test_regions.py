@@ -468,3 +468,169 @@ def test_pending_candidate_is_restored_and_damage_flagged(tmp_path):
     damaged = RegionWorkspace.open(root, graph, cache)
     assert damaged.candidates["left"].tile_intact() is False
     assert damaged.candidates["left"].full_digest_match is False
+
+
+def _wide_graph(width=96, height=48):
+    """Non-square canvas; fg -> blur -> blend crosses region boundaries."""
+    graph = Graph(width=width, height=height)
+    graph.add_node("uv", "uv_coordinates")
+    graph.add_node("m", "circle_mask", {"radius": 0.5, "softness": 0.02})
+    graph.add_node("fg", "solid_color", {"color": [0.8, 0.6, 0.2, 1.0]})
+    graph.add_node("bg", "solid_color", {"color": [0.1, 0.1, 0.2, 1.0]})
+    graph.add_node("mix", "blend_colors")
+    graph.add_node("blur", "box_blur", {"radius": 2})
+    graph.add_node("out", "blend_colors")
+    graph.add_node("base", "solid_color", {"color": [0.2, 0.2, 0.2, 1.0]})
+    graph.connect("uv", "m", "coordinates")
+    graph.connect("fg", "mix", "foreground")
+    graph.connect("bg", "mix", "background")
+    graph.connect("m", "mix", "mask")
+    graph.connect("mix", "blur", "image")
+    graph.connect("blur", "out", "foreground")
+    graph.connect("base", "out", "background")
+    graph.connect("m", "out", "mask")
+    return graph
+
+
+# Non-square 96x48 canvas.  LEFT and MID writes do not overlap, but the
+# blur halo (radius 5 via override) makes each read the other's pixels.
+W_LEFT = Region(0, 0, 40, 48)
+W_MID = Region(44, 0, 60, 48)
+W_FAR = Region(80, 0, 96, 48)
+W_LEFT_OVERRIDES = {"blur": {"radius": 5}, "m": {"radius": 0.3}}
+W_MID_OVERRIDES = {"blur": {"radius": 5}, "m": {"softness": 0.2}}
+W_FAR_OVERRIDES = {"m": {"radius": 0.15}}
+
+
+def test_plan_combinations_reports_read_write_dependencies(tmp_path):
+    graph = _wide_graph()
+    workspace = _workspace(tmp_path, graph)
+    target = RegionTarget("out", 96, 48)
+    workspace.publish(target)
+    workspace.create_candidate("left", target, W_LEFT, W_LEFT_OVERRIDES)
+    workspace.create_candidate("mid", target, W_MID, W_MID_OVERRIDES)
+    workspace.create_candidate("far", target, W_FAR, W_FAR_OVERRIDES)
+
+    plan = workspace.plan_combinations(target)
+    entries = {entry["id"]: entry for entry in plan["candidates"]}
+    # Read windows are dilated by the accumulated blur radius (5).
+    assert entries["left"]["read_region"] == [0, 0, 45, 48]
+    assert entries["mid"]["read_region"] == [39, 0, 65, 48]
+    # far keeps the default blur radius (2), so its halo is narrower.
+    assert entries["far"]["read_region"] == [78, 0, 96, 48]
+
+    # Geometrically disjoint writes still depend through the blur halo.
+    assert not W_LEFT.intersects(W_MID)
+    deps = {
+        (tuple(dep["candidates"]), dep["kind"]): dep
+        for dep in plan["dependencies"]
+    }
+    mutual = deps[(("left", "mid"), "read_write")]
+    assert mutual["detail"]["left_reads_mid"]["pixels"] > 0
+    assert mutual["detail"]["mid_reads_left"]["pixels"] > 0
+    assert (("left", "far"), "read_write") not in deps
+    assert (("mid", "far"), "read_write") not in deps
+
+    assert plan["conflict_clusters"] == [["left", "mid"]]
+    assert plan["independent"] == ["far"]
+    assert plan["requires_revalidation"] == []
+
+    combos = {tuple(combo["candidates"]) for combo in plan["combinations"]}
+    assert ("left", "mid") not in combos
+    assert ("far", "left") in combos
+    assert ("far", "mid") in combos
+
+    satisfy = plan["plans"]["satisfy_regions"]
+    assert satisfy["satisfied_regions"] == 2
+    assert satisfy["candidates"] == ["far", "left"]
+    preserve = plan["plans"]["preserve_current"]
+    assert preserve["candidates"] == ["far", "mid"]
+    assert preserve["changed_pixels"] == (16 + 16) * 48
+    assert preserve["preserved_pixels"] == 96 * 48 - preserve["changed_pixels"]
+    assert preserve["changed_pixels"] < satisfy["changed_pixels"]
+
+
+def test_plan_combinations_marks_write_overlap_and_stale_inputs(tmp_path):
+    graph = _wide_graph()
+    workspace = _workspace(tmp_path, graph)
+    target = RegionTarget("out", 96, 48)
+    workspace.publish(target)
+    workspace.create_candidate("left", target, W_LEFT, W_LEFT_OVERRIDES)
+    workspace.create_candidate(
+        "overlap", target, Region(16, 0, 48, 48), {"blur": {"radius": 1}}
+    )
+
+    plan = workspace.plan_combinations(target)
+    deps = {
+        (tuple(dep["candidates"]), dep["kind"]): dep
+        for dep in plan["dependencies"]
+    }
+    overlap = deps[(("left", "overlap"), "write_overlap")]
+    assert overlap["detail"]["region"] == [16, 0, 40, 48]
+    assert plan["conflict_clusters"] == [["left", "overlap"]]
+
+    # Changing the original inputs invalidates the derived dependencies:
+    # every candidate reading the changed node is flagged for revalidation.
+    # (A shared parameter neither candidate pins with its own overrides.)
+    workspace.graph.set_param("fg", "color", [0.1, 0.9, 0.3, 1.0])
+    plan = workspace.plan_combinations(target)
+    assert sorted(plan["requires_revalidation"]) == ["left", "overlap"]
+    assert all(entry["inputs_changed"] for entry in plan["candidates"])
+    assert all(combo["stale"] for combo in plan["combinations"])
+
+    with pytest.raises(ValueError, match="revalidate"):
+        workspace.adopt_combination(["left"])
+    workspace.revalidate_candidate("left")
+    workspace.revalidate_candidate("overlap")
+    plan = workspace.plan_combinations(target)
+    assert plan["requires_revalidation"] == []
+
+
+def test_adopt_combination_requires_dependency_closure(tmp_path):
+    graph = _wide_graph()
+    workspace = _workspace(tmp_path, graph)
+    target = RegionTarget("out", 96, 48)
+    workspace.publish(target)
+    workspace.create_candidate("left", target, W_LEFT, W_LEFT_OVERRIDES)
+    workspace.create_candidate("mid", target, W_MID, W_MID_OVERRIDES)
+
+    # Mutually reading candidates cannot be taken together even though
+    # their write rectangles are disjoint.
+    with pytest.raises(ValueError, match="neighbourhood read"):
+        workspace.adopt_combination(["left", "mid"])
+
+    workspace.create_candidate(
+        "cover", target, Region(0, 0, 40, 48), {"blur": {"radius": 3}}
+    )
+    with pytest.raises(ValueError, match="overlapping"):
+        workspace.adopt_combination(["left", "cover"])
+
+
+def test_adopt_combination_publishes_selected_and_keeps_unselected(tmp_path):
+    graph = _wide_graph()
+    workspace = _workspace(tmp_path, graph)
+    target = RegionTarget("out", 96, 48)
+    workspace.publish(target)
+    baseline_pixels = np.asarray(
+        Image.open(workspace.published_path(target)).convert("RGBA")
+    ).copy()
+    workspace.create_candidate("left", target, W_LEFT, W_LEFT_OVERRIDES)
+    workspace.create_candidate("mid", target, W_MID, W_MID_OVERRIDES)
+    workspace.create_candidate("far", target, W_FAR, W_FAR_OVERRIDES)
+
+    # Independent parts adopt together; the conflicting middle stays pending.
+    result = workspace.adopt_combination(["left", "far"])
+    assert result["adopted"] == ["left", "far"]
+    assert result["version"] == 3
+    assert set(workspace.candidates) == {"mid"}
+
+    pixels = np.asarray(
+        Image.open(workspace.published_path(target)).convert("RGBA")
+    )
+    full_left = _full_png(graph, target, W_LEFT_OVERRIDES)
+    full_far = _full_png(graph, target, W_FAR_OVERRIDES)
+    assert np.array_equal(pixels[:, 0:40], full_left[:, 0:40])
+    assert np.array_equal(pixels[:, 80:96], full_far[:, 80:96])
+    # Unselected regions (including the pending conflict zone) are
+    # preserved byte for byte from the previous publish.
+    assert np.array_equal(pixels[:, 40:80], baseline_pixels[:, 40:80])

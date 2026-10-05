@@ -528,6 +528,12 @@ def evaluate_region(
                     max(old[3], needed[3]),
                 )
                 windows[source] = merged
+                if merged != old:
+                    # A consumer downstream of a neighbourhood node may
+                    # have widened this window after it was first
+                    # propagated; re-propagate so upstream sources cover
+                    # the full merged halo.
+                    pending.append(source)
             else:
                 windows[source] = needed
                 pending.append(source)
