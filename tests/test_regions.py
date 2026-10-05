@@ -121,7 +121,7 @@ def test_adopting_one_of_two_adjacent_candidates_keeps_other_region(tmp_path):
     )
 
 
-def test_adjacent_pending_candidates_can_be_adopted_in_either_order(tmp_path):
+def test_adjacent_blur_candidates_report_mutual_read_dependency(tmp_path):
     graph = _pattern_graph()
     workspace = _workspace(tmp_path, graph)
     target = RegionTarget("out", 64, 64)
@@ -129,24 +129,148 @@ def test_adjacent_pending_candidates_can_be_adopted_in_either_order(tmp_path):
     workspace.create_candidate("left", target, LEFT, LEFT_OVERRIDES)
     workspace.create_candidate("right", target, RIGHT, RIGHT_OVERRIDES)
 
-    # Adjacent pending candidates are not a conflict; the second simply
-    # stays pending while the first is adopted in a new version.
+    plan = workspace.plan_candidate_combinations(target)
+    conflict = plan["conflicts"][0]
+    assert "read-after-write:left<-right" in conflict["reasons"]
+    assert "read-after-write:right<-left" in conflict["reasons"]
+    assert conflict["mutual_read_dependency"] is True
+    with pytest.raises(ValueError, match="mutual_read|read-after-write|cancelled explicitly"):
+        workspace.adopt_candidate("left")
+    with pytest.raises(ValueError, match="read-after-write"):
+        workspace.adopt_candidate_combinations(["left", "right"])
+
+    workspace.cancel_candidate("right")
     first = workspace.adopt_candidate("left")
     assert first.published_version == 2
-    assert "right" in workspace.candidates
-    second = workspace.adopt_candidate("right")
-    assert second.published_version == 3
-    assert not workspace.candidates
 
     full = _full_png(graph, target)
     full_left = _full_png(graph, target, LEFT_OVERRIDES)
-    full_right = _full_png(graph, target, RIGHT_OVERRIDES)
     pixels = np.asarray(
         Image.open(workspace.published_path(target)).convert("RGBA")
     )
     assert np.array_equal(np.asarray(pixels)[:, :32], full_left[:, :32])
-    assert np.array_equal(np.asarray(pixels)[:, 32:], full_right[:, 32:])
+    baseline = np.asarray(
+        Image.open(workspace._published_path(target, 1)).convert("RGBA")
+    )
+    assert np.array_equal(np.asarray(pixels)[:, 32:], baseline[:, 32:])
     assert not np.array_equal(np.asarray(pixels), full)
+
+
+def test_read_window_extends_write_region_for_cross_boundary_blur(tmp_path):
+    graph = _pattern_graph()
+    workspace = _workspace(tmp_path, graph)
+    target = RegionTarget("out", 64, 64)
+    workspace.publish(target)
+    candidate = workspace.create_candidate("left", target, LEFT, LEFT_OVERRIDES)
+    assert candidate.read_region == Region(0, 0, 37, 64)
+
+
+def test_non_square_canvas_edge_blur_read_window_is_clamped(tmp_path):
+    width, height = 90, 40
+    graph = _pattern_graph(width=width, height=height)
+    workspace = _workspace(tmp_path, graph)
+    target = RegionTarget("out", width, height)
+    workspace.publish(target)
+    candidate = workspace.create_candidate(
+        "top_edge",
+        target,
+        Region(30, 0, 60, 8),
+        LEFT_OVERRIDES,
+    )
+    assert candidate.read_region == Region(25, 0, 65, 13)
+
+
+def test_input_change_revalidation_rechecks_read_dependency_window(tmp_path):
+    graph = _pattern_graph()
+    cache = EvaluationCache()
+    root = str(tmp_path / "regions")
+    workspace = RegionWorkspace(root, graph, cache)
+    target = RegionTarget("out", 64, 64)
+    workspace.publish(target)
+    workspace.create_candidate("plain", target, LEFT, {})
+    assert workspace.candidates["plain"].read_region == Region(0, 0, 35, 64)
+    workspace.save_state()
+
+    graph.set_param("blur", "radius", 5)
+    resumed = RegionWorkspace.open(root, graph, cache, recover=False)
+    stale_plan = resumed.plan_candidate_combinations(target)
+    assert stale_plan["stale_input_candidate_ids"] == ["plain"]
+    with pytest.raises(ValueError, match="changed inputs"):
+        resumed.adopt_candidate("plain")
+
+    resumed.recover_target(target)
+    refreshed = resumed.candidates["plain"]
+    assert refreshed.read_region == Region(0, 0, 37, 64)
+    current_plan = resumed.plan_candidate_combinations(target)
+    assert current_plan["stale_input_candidate_ids"] == []
+
+
+def test_independent_distant_candidates_can_be_adopted_together(tmp_path):
+    graph = _pattern_graph()
+    workspace = _workspace(tmp_path, graph)
+    target = RegionTarget("out", 64, 64)
+    workspace.publish(target)
+    far_left = Region(0, 0, 20, 64)
+    far_right = Region(44, 0, 64, 64)
+    workspace.create_candidate("a", target, far_left, LEFT_OVERRIDES)
+    workspace.create_candidate("b", target, far_right, RIGHT_OVERRIDES)
+
+    plan = workspace.plan_candidate_combinations(target, ["a", "b"])
+    assert plan["conflicts"] == []
+    recommended = plan["recommended_for_desired_region"]
+    assert recommended["candidate_ids"] == ["a", "b"]
+    assert recommended["is_complete"] is True
+
+    adopted = workspace.adopt_candidate_combinations(["a", "b"])
+    assert sorted(tile.candidate_id for tile in adopted) == ["a", "b"]
+    assert all(tile.published_version == 2 for tile in adopted)
+    full_a = _full_png(graph, target, LEFT_OVERRIDES)
+    full_b = _full_png(graph, target, RIGHT_OVERRIDES)
+    published = np.asarray(
+        Image.open(workspace.published_path(target)).convert("RGBA")
+    )
+    baseline = np.asarray(
+        Image.open(workspace._published_path(target, 1)).convert("RGBA")
+    )
+    assert np.array_equal(np.asarray(published)[:, :20], full_a[:, :20])
+    assert np.array_equal(np.asarray(published)[:, 44:], full_b[:, 44:])
+    assert np.array_equal(np.asarray(published)[:, 20:44], baseline[:, 20:44])
+
+
+def test_non_square_mutual_blur_comparison_preserves_unselected_region(tmp_path):
+    width, height = 90, 40
+    graph = _pattern_graph(width=width, height=height)
+    workspace = _workspace(tmp_path, graph)
+    target = RegionTarget("out", width, height)
+    workspace.publish(target)
+    a_region = Region(0, 0, 50, height)
+    b_region = Region(40, 0, width, height)
+    workspace.create_candidate("a", target, a_region, LEFT_OVERRIDES)
+    workspace.create_candidate("b", target, b_region, RIGHT_OVERRIDES)
+
+    plan = workspace.plan_candidate_combinations(target, ["a", "b"])
+    combinations = {
+        tuple(record["candidate_ids"]): record
+        for record in plan["independent_combinations"]
+    }
+    assert ("a",) in combinations
+    assert ("b",) in combinations
+    assert ("a", "b") not in combinations
+    desired = plan["recommended_for_desired_region"]
+    assert desired["candidate_ids"] == ["b"]
+    assert desired["satisfied_desired_pixels"] == 50 * height
+
+    workspace.cancel_candidate("a")
+    workspace.adopt_candidate("b")
+    full_b = _full_png(graph, target, RIGHT_OVERRIDES)
+    published = np.asarray(
+        Image.open(workspace.published_path(target)).convert("RGBA")
+    )
+    baseline = np.asarray(
+        Image.open(workspace._published_path(target, 1)).convert("RGBA")
+    )
+    assert np.array_equal(np.asarray(published)[:, 40:], full_b[:, 40:])
+    assert np.array_equal(np.asarray(published)[:, :40], baseline[:, :40])
 
 
 def test_overlapping_pending_candidates_require_explicit_choice(tmp_path):
@@ -172,7 +296,7 @@ def test_overlapping_pending_candidates_require_explicit_choice(tmp_path):
     assert adopted.published_version == 2
 
     workspace.create_candidate("left2", target, LEFT, LEFT_OVERRIDES)
-    with pytest.raises(ValueError, match="overlaps adopted"):
+    with pytest.raises(ValueError, match="write-overlap|conflict with adopted"):
         workspace.adopt_candidate("left2")
     replaced = workspace.adopt_candidate("left2", replace=True)
     assert replaced.published_version == 3

@@ -500,37 +500,14 @@ def evaluate_region(
         order, pixel_width, pixel_height, context.time
     )
 
-    # Back-propagate the needed window from output to sources.  Each
-    # neighbourhood node dilates by its radius (clamped to the canvas); each
-    # pointwise node passes the same window on to every input.
-    windows: dict[str, tuple[int, int, int, int]] = {output_node: (x0, y0, x1, y1)}
-    pending = [output_node]
-    while pending:
-        node_id = pending.pop()
-        box = windows[node_id]
-        node = graph.nodes[node_id]
-        node_type = NODE_TYPES[node.type]
-        params = graph.params_at(node_id, context.time)
-        radius = neighborhood_radius(node.type, params)
-        needed = _clip_box(
-            (box[0] - radius, box[1] - radius, box[2] + radius, box[3] + radius),
-            pixel_width,
-            pixel_height,
-        )
-        for connection in graph.inputs_for(node_id).values():
-            source = connection.source_node
-            if source in windows:
-                old = windows[source]
-                merged = (
-                    min(old[0], needed[0]),
-                    min(old[1], needed[1]),
-                    max(old[2], needed[2]),
-                    max(old[3], needed[3]),
-                )
-                windows[source] = merged
-            else:
-                windows[source] = needed
-                pending.append(source)
+    windows = required_region_windows(
+        graph,
+        output_node,
+        (x0, y0, x1, y1),
+        pixel_width,
+        pixel_height,
+        context.time,
+    )
 
     values: dict[str, np.ndarray] = {}
     boxes: dict[str, tuple[int, int, int, int]] = {}
@@ -626,6 +603,50 @@ def evaluate_region(
         context.evaluated.append(node_id)
 
     return values[output_node]
+
+
+def required_region_windows(
+    graph: "Graph",
+    output_node: str,
+    region: tuple[int, int, int, int],
+    width: int,
+    height: int,
+    time: float,
+) -> dict[str, tuple[int, int, int, int]]:
+    """Back-propagate pixel windows required to evaluate an output region."""
+    x0, y0, x1, y1 = _clip_box(region, width, height)
+    if x1 <= x0 or y1 <= y0:
+        raise GraphValidationError("region must contain at least one pixel")
+    windows: dict[str, tuple[int, int, int, int]] = {
+        output_node: (x0, y0, x1, y1)
+    }
+    pending = [output_node]
+    while pending:
+        node_id = pending.pop()
+        box = windows[node_id]
+        node = graph.nodes[node_id]
+        node_type = NODE_TYPES[node.type]
+        params = graph.params_at(node_id, time)
+        radius = neighborhood_radius(node.type, params)
+        needed = _clip_box(
+            (box[0] - radius, box[1] - radius, box[2] + radius, box[3] + radius),
+            width,
+            height,
+        )
+        for connection in graph.inputs_for(node_id).values():
+            source = connection.source_node
+            if source in windows:
+                old = windows[source]
+                windows[source] = (
+                    min(old[0], needed[0]),
+                    min(old[1], needed[1]),
+                    max(old[2], needed[2]),
+                    max(old[3], needed[3]),
+                )
+            else:
+                windows[source] = needed
+                pending.append(source)
+    return windows
 
 
 def expected_output_shape(output_type: str, width: int, height: int) -> tuple[int, ...]:

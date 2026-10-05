@@ -17,6 +17,7 @@ from .engine import (
     RenderContext,
     TextureEngine,
     image_digest,
+    required_region_windows,
     stable_json,
     to_pil_image,
 )
@@ -145,6 +146,7 @@ class Candidate:
     full_digest_match: bool
     output_signature: str = ""
     node_signatures: dict[str, str] = field(default_factory=dict)
+    read_region: Region | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -168,6 +170,7 @@ class Candidate:
             "full_digest_match": self.full_digest_match,
             "output_signature": self.output_signature,
             "node_signatures": dict(sorted(self.node_signatures.items())),
+            "read_region": (self.read_region or self.region).as_list(),
         }
 
     @classmethod
@@ -195,6 +198,9 @@ class Candidate:
             full_digest_match=bool(document.get("full_digest_match", False)),
             output_signature=document.get("output_signature", ""),
             node_signatures=dict(document.get("node_signatures", {})),
+            read_region=Region.from_list(
+                document.get("read_region", document["region"])
+            ),
         )
 
     def tile_intact(self) -> bool:
@@ -230,6 +236,7 @@ class AdoptedTile:
     tile_path: str
     valid: bool = True
     reason: str = ""
+    read_region: Region | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -252,6 +259,7 @@ class AdoptedTile:
             "tile_path": self.tile_path,
             "valid": self.valid,
             "reason": self.reason,
+            "read_region": (self.read_region or self.region).as_list(),
         }
 
     @classmethod
@@ -278,6 +286,9 @@ class AdoptedTile:
             tile_path=document["tile_path"],
             valid=bool(document.get("valid", True)),
             reason=document.get("reason", ""),
+            read_region=Region.from_list(
+                document.get("read_region", document["region"])
+            ),
         )
 
 
@@ -385,6 +396,158 @@ class RegionWorkspace:
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _candidate_read_region(
+        self,
+        engine: TextureEngine,
+        target: RegionTarget,
+        region: Region,
+    ) -> Region:
+        windows = required_region_windows(
+            engine.graph,
+            target.node_id,
+            region.tuple,
+            target.width,
+            target.height,
+            target.time,
+        )
+        return Region(
+            min(box[0] for box in windows.values()),
+            min(box[1] for box in windows.values()),
+            max(box[2] for box in windows.values()),
+            max(box[3] for box in windows.values()),
+        )
+
+    def _region_mask(
+        self,
+        canvas_shape: tuple[int, int],
+        region: Region,
+        local_mask: np.ndarray | None = None,
+    ) -> np.ndarray:
+        mask = np.zeros(canvas_shape, dtype=bool)
+        target = (
+            slice(region.y0, region.y1),
+            slice(region.x0, region.x1),
+        )
+        mask[target] = True if local_mask is None else local_mask
+        return mask
+
+    def _candidate_changed_mask(
+        self,
+        candidate: Candidate,
+        tile: np.ndarray,
+        reference: np.ndarray,
+    ) -> np.ndarray:
+        old = reference[
+            candidate.region.y0 : candidate.region.y1,
+            candidate.region.x0 : candidate.region.x1,
+        ]
+        changed = np.any(tile != old, axis=-1)
+        return self._region_mask(reference.shape[:2], candidate.region, changed)
+
+    def _adopted_changed_mask(
+        self, tile: AdoptedTile, reference: np.ndarray
+    ) -> np.ndarray:
+        if not os.path.exists(tile.tile_path):
+            return self._region_mask(reference.shape[:2], tile.region)
+        current = _read_png(tile.tile_path)
+        old = reference[
+            tile.region.y0 : tile.region.y1,
+            tile.region.x0 : tile.region.x1,
+        ]
+        if current.shape != old.shape:
+            return self._region_mask(reference.shape[:2], tile.region)
+        changed = np.any(current != old, axis=-1)
+        return self._region_mask(reference.shape[:2], tile.region, changed)
+
+    def _baseline_pixels(self, target: RegionTarget) -> np.ndarray | None:
+        path = self._published_path(target, 1)
+        if not os.path.exists(path):
+            return None
+        return _read_png(path)
+
+    def _candidate_inputs_current(
+        self, candidate: Candidate, target: RegionTarget
+    ) -> bool:
+        _, current_signatures, _ = self._node_signatures(
+            target, candidate.overrides
+        )
+        return all(
+            candidate.node_signatures.get(node_id) == signature
+            for node_id, signature in current_signatures.items()
+            if node_id in candidate.node_signatures
+        )
+
+    def _pending_candidate_conflicts(
+        self,
+        target: RegionTarget,
+        candidates: list[Candidate],
+        reference: np.ndarray | None = None,
+    ) -> tuple[dict[frozenset[str], dict[str, object]], dict[str, np.ndarray]]:
+        if reference is None:
+            reference = self._baseline_pixels(target)
+        tiles: dict[str, np.ndarray] = {}
+        changed: dict[str, np.ndarray] = {}
+        for candidate in candidates:
+            if candidate.tile_intact() and reference is not None:
+                tile = _read_png(candidate.tile_path)
+                tiles[candidate.id] = tile
+                changed[candidate.id] = self._candidate_changed_mask(
+                    candidate, tile, reference
+                )
+
+        conflicts: dict[frozenset[str], dict[str, object]] = {}
+        for index, candidate in enumerate(candidates):
+            read_region = candidate.read_region or candidate.region
+            for other in candidates[index + 1 :]:
+                reasons = []
+                if candidate.region.intersects(other.region):
+                    reasons.append("write-overlap")
+                other_read_region = other.read_region or other.region
+                candidate_depends = (
+                    candidate.id in changed
+                    and other.id in changed
+                    and bool(
+                        np.any(
+                            changed[other.id][
+                                read_region.y0 : read_region.y1,
+                                read_region.x0 : read_region.x1,
+                            ]
+                        )
+                    )
+                )
+                other_depends = (
+                    candidate.id in changed
+                    and other.id in changed
+                    and bool(
+                        np.any(
+                            changed[candidate.id][
+                                other_read_region.y0 : other_read_region.y1,
+                                other_read_region.x0 : other_read_region.x1,
+                            ]
+                        )
+                    )
+                )
+                if candidate_depends:
+                    reasons.append(f"read-after-write:{candidate.id}<-{other.id}")
+                if other_depends:
+                    reasons.append(f"read-after-write:{other.id}<-{candidate.id}")
+                if reasons:
+                    conflicts[frozenset((candidate.id, other.id))] = {
+                        "reasons": reasons,
+                        "write_regions": {
+                            candidate.id: candidate.region.as_list(),
+                            other.id: other.region.as_list(),
+                        },
+                        "read_regions": {
+                            candidate.id: read_region.as_list(),
+                            other.id: other_read_region.as_list(),
+                        },
+                        "mutual_read_dependency": (
+                            candidate_depends and other_depends
+                        ),
+                    }
+        return conflicts, changed
 
     # ------------------------------------------------------------------
     # baseline publishing
@@ -584,6 +747,7 @@ class RegionWorkspace:
             full_digest_match=match,
             output_signature=signatures[target.node_id],
             node_signatures=dict(sorted(signatures.items())),
+            read_region=self._candidate_read_region(engine, target, region),
         )
         _write_json(meta_path, candidate.to_dict())
         self.candidates[candidate_id] = candidate
@@ -618,6 +782,160 @@ class RegionWorkspace:
         if not candidate.tile_intact():
             return None
         return _read_png(candidate.tile_path)
+
+    def _region_area(self, regions: list[Region]) -> int:
+        if not regions:
+            return 0
+        height = max(region.y1 for region in regions)
+        width = max(region.x1 for region in regions)
+        mask = np.zeros((height, width), dtype=bool)
+        for region in regions:
+            mask[region.y0 : region.y1, region.x0 : region.x1] = True
+        return int(np.count_nonzero(mask))
+
+    def plan_candidate_combinations(
+        self,
+        target: RegionTarget,
+        desired_candidate_ids: tuple[str, ...] | list[str] | set[str] = (),
+    ) -> dict[str, object]:
+        """Enumerate simultaneously adoptable dependency-closed combinations."""
+        candidates = sorted(
+            (
+                candidate
+                for candidate in self.candidates.values()
+                if candidate.target.key() == target.key()
+            ),
+            key=lambda candidate: candidate.id,
+        )
+        desired = {str(candidate_id) for candidate_id in desired_candidate_ids}
+        unknown = sorted(desired - {candidate.id for candidate in candidates})
+        if unknown:
+            raise KeyError(f"no such candidate(s): {', '.join(unknown)}")
+
+        reference = self._baseline_pixels(target)
+        stale_inputs = {
+            candidate.id: not self._candidate_inputs_current(candidate, target)
+            for candidate in candidates
+        }
+        conflicts, changed = self._pending_candidate_conflicts(
+            target, candidates, reference
+        )
+        conflict_by_id: dict[str, dict[str, dict[str, object]]] = {
+            candidate.id: {} for candidate in candidates
+        }
+        conflict_records: list[dict[str, object]] = []
+        for pair, detail in conflicts.items():
+            a, b = sorted(pair)
+            conflict_by_id[a][b] = detail
+            conflict_by_id[b][a] = detail
+            conflict_records.append({"candidate_ids": [a, b], **detail})
+
+        candidate_by_id = {candidate.id: candidate for candidate in candidates}
+        valid_combinations: list[frozenset[str]] = [frozenset()]
+        for candidate in candidates:
+            previous = list(valid_combinations)
+            for subset in previous:
+                if not subset.intersection(conflict_by_id[candidate.id]):
+                    valid_combinations.append(subset | {candidate.id})
+
+        maximal = [
+            subset
+            for subset in valid_combinations
+            if all(
+                subset >= other or not subset.issubset(other)
+                for other in valid_combinations
+                if other != subset
+            )
+        ]
+        maximal = [
+            subset
+            for subset in maximal
+            if not any(subset < other for other in maximal)
+        ]
+
+        desired_regions = [
+            candidate_by_id[candidate_id].region
+            for candidate_id in desired
+            if candidate_id in candidate_by_id
+        ]
+        desired_area = self._region_area(desired_regions)
+        combination_records = []
+        for subset in sorted(
+            set(maximal), key=lambda ids: (-len(ids), tuple(sorted(ids)))
+        ):
+            selected = [candidate_by_id[candidate_id] for candidate_id in sorted(subset)]
+            selected_area = self._region_area([candidate.region for candidate in selected])
+            changed_pixels = 0
+            if reference is not None and subset:
+                changed_union = np.zeros(reference.shape[:2], dtype=bool)
+                for candidate_id in subset:
+                    if candidate_id in changed:
+                        changed_union |= changed[candidate_id]
+                changed_pixels = int(np.count_nonzero(changed_union))
+            satisfied_pixels = 0
+            if desired_area:
+                if reference is None:
+                    continue
+                satisfied_mask = np.zeros(reference.shape[:2], dtype=bool)
+                for candidate_id in subset:
+                    region = candidate_by_id[candidate_id].region
+                    if satisfied_mask is not None:
+                        satisfied_mask[region.y0 : region.y1, region.x0 : region.x1] = True
+                desired_mask = np.zeros_like(satisfied_mask)
+                for region in desired_regions:
+                    desired_mask[region.y0 : region.y1, region.x0 : region.x1] = True
+                satisfied_pixels = int(np.count_nonzero(desired_mask & satisfied_mask))
+            combination_records.append(
+                {
+                    "candidate_ids": sorted(subset),
+                    "write_pixels": selected_area,
+                    "changed_pixels": changed_pixels,
+                    "retained_current_pixels": (
+                        int(reference.shape[0] * reference.shape[1] - changed_pixels)
+                        if reference is not None
+                        else None
+                    ),
+                    "desired_pixels": desired_area,
+                    "satisfied_desired_pixels": satisfied_pixels,
+                    "is_complete": desired.issubset(subset),
+                }
+            )
+
+        def recommendation(key: str):
+            records = [
+                record for record in combination_records
+                if not desired or record["is_complete"] or key == "retained"
+            ]
+            if not records:
+                records = combination_records
+            reverse = key == "satisfied"
+            metric = (
+                "satisfied_desired_pixels" if reverse else "retained_current_pixels"
+            )
+            return max(
+                records,
+                key=lambda record: (
+                    record[metric] is not None,
+                    record[metric] if record[metric] is not None else 0,
+                    record["write_pixels"],
+                    len(record["candidate_ids"]),
+                    tuple(record["candidate_ids"]),
+                ),
+            )
+
+        return {
+            "target": target.node_id,
+            "candidate_ids": [candidate.id for candidate in candidates],
+            "stale_input_candidate_ids": sorted(
+                candidate_id
+                for candidate_id, is_stale in stale_inputs.items()
+                if is_stale
+            ),
+            "conflicts": conflict_records,
+            "independent_combinations": combination_records,
+            "recommended_for_current_pixels": recommendation("retained"),
+            "recommended_for_desired_region": recommendation("satisfied"),
+        }
 
     def _pixel_diff(
         self, a: np.ndarray, b: np.ndarray
@@ -661,6 +979,7 @@ class RegionWorkspace:
             entry: dict[str, object] = {
                 "id": candidate.id,
                 "region": candidate.region.as_list(),
+                "read_region": (candidate.read_region or candidate.region).as_list(),
                 "overrides": {
                     node_id: dict(params)
                     for node_id, params in candidate.overrides.items()
@@ -797,93 +1116,172 @@ class RegionWorkspace:
         candidate.full_digest_match = True
         candidate.output_signature = signatures[target.node_id]
         candidate.node_signatures = dict(sorted(signatures.items()))
+        candidate.read_region = self._candidate_read_region(engine, target, region)
         _write_json(candidate.meta_path, candidate.to_dict())
         report["recomputed"] = True
         report["content_digest"] = digest
         return report
 
-    def adopt_candidate(
+    def adopt_candidate_combinations(
         self,
-        candidate_id: str,
+        candidate_ids: tuple[str, ...] | list[str],
         replace: bool = False,
         is_cancelled: Callable[[], bool] = lambda: False,
-    ) -> AdoptedTile:
-        """Publish a new version containing exactly one candidate region.
+    ) -> list[AdoptedTile]:
+        """Atomically publish one dependency-closed set of candidates.
 
-        Overlapping pending candidates and overlapping already-adopted
-        regions both require an explicit choice: conflicting pending
-        candidates must be cancelled (or adopted with ``replace=True``)
-        first, and conflicting adopted regions need ``replace=True``.
-        Merely adjacent pending candidates are left untouched and can be
-        adopted afterwards; registration order never decides a conflict.
+        Conflict detection uses both write rectangles and the actual read
+        windows used during local evaluation.  A blur can therefore depend on
+        a geometrically disjoint candidate.  Every conflicting pending plan
+        must be selected or cancelled explicitly, and conflicting adopted
+        tiles require ``replace=True``.
         """
-        candidate = self.candidates.get(candidate_id)
-        if candidate is None:
-            raise KeyError(f"no such candidate: {candidate_id}")
-        target = candidate.target
-        if not candidate.tile_intact():
-            raise ValueError(
-                f"candidate {candidate_id} tile is missing or damaged; recompute it"
-            )
+        requested = [str(candidate_id) for candidate_id in candidate_ids]
+        if not requested:
+            raise ValueError("at least one candidate must be selected")
+        selected_ids = []
+        selected: list[Candidate] = []
+        target: RegionTarget | None = None
+        for candidate_id in requested:
+            candidate = self.candidates.get(candidate_id)
+            if candidate is None:
+                raise KeyError(f"no such candidate: {candidate_id}")
+            if target is None:
+                target = candidate.target
+            elif candidate.target.key() != target.key():
+                raise ValueError("candidates must belong to the same target")
+            if candidate_id not in selected_ids:
+                selected_ids.append(candidate_id)
+                selected.append(candidate)
+        assert target is not None
+
+        for candidate in selected:
+            if not candidate.tile_intact():
+                raise ValueError(
+                    f"candidate {candidate.id} tile is missing or damaged; recompute it"
+                )
+            if not self._candidate_inputs_current(candidate, target):
+                raise ValueError(
+                    f"candidate {candidate.id} depends on changed inputs; revalidate it "
+                    "and recheck its region dependencies before adopting"
+                )
         current_version = self._current_version(target)
         if current_version is None:
             raise GraphValidationError("target baseline is missing")
 
-        pending_overlaps = sorted(
-            other.id
+        baseline = self._baseline_pixels(target)
+        pending = [
+            other
             for other in self.candidates.values()
-            if other.id != candidate.id
-            and other.target.key() == target.key()
-            and other.region.intersects(candidate.region)
+            if other.target.key() == target.key()
+        ]
+        pending_conflicts, _ = self._pending_candidate_conflicts(
+            target, pending, baseline
         )
-        if pending_overlaps:
+        selected_set = set(selected_ids)
+        pending_conflicting_ids = set()
+        pending_conflict_details = []
+        selected_conflict = False
+        for pair, detail in pending_conflicts.items():
+            if pair.issubset(selected_set):
+                selected_conflict = True
+                pending_conflict_details.append(
+                    (",".join(sorted(pair)), detail)
+                )
+            elif pair.intersection(selected_set):
+                other_id = next(iter(pair - selected_set))
+                pending_conflicting_ids.add(other_id)
+                pending_conflict_details.append((other_id, detail))
+        if pending_conflicting_ids or selected_conflict:
+            details = "; ".join(
+                f"{candidate_id}: {', '.join(detail['reasons'])}"
+                for candidate_id, detail in sorted(pending_conflict_details)
+            )
             raise ValueError(
-                "pending candidate(s) overlap this region and must be "
-                "chosen or cancelled explicitly first: "
-                f"{', '.join(pending_overlaps)}"
+                "pending candidate(s) write to this range or supply pixels read "
+                "by it and must be chosen or cancelled explicitly first: " + details
             )
 
         active = [
-            tile for tile in self.adopted if tile.valid and tile.target.key() == target.key()
-        ]
-        overlapping = [
             tile
-            for tile in active
-            if tile.region.intersects(candidate.region)
+            for tile in self.adopted
+            if tile.valid and tile.target.key() == target.key()
         ]
-        if overlapping and not replace:
-            ids = ", ".join(sorted(tile.candidate_id for tile in overlapping))
-            raise ValueError(
-                f"candidate overlaps adopted region(s): {ids}; adopt with "
-                "replace=True or cancel the overlap explicitly"
+        selected_tiles = {
+            candidate.id: _read_png(candidate.tile_path)
+            for candidate in selected
+        }
+        selected_changed = {}
+        if baseline is not None:
+            for candidate in selected:
+                selected_changed[candidate.id] = self._candidate_changed_mask(
+                    candidate, selected_tiles[candidate.id], baseline
+                )
+        active_conflicts = []
+        if baseline is not None:
+            for tile in active:
+                active_changed = self._adopted_changed_mask(tile, baseline)
+                tile_region = tile.read_region or tile.region
+                reasons = []
+                for candidate in selected:
+                    candidate_region = candidate.read_region or candidate.region
+                    if tile.region.intersects(candidate.region):
+                        reasons.append("write-overlap")
+                    if np.any(
+                        active_changed[
+                            candidate_region.y0 : candidate_region.y1,
+                            candidate_region.x0 : candidate_region.x1,
+                        ]
+                    ):
+                        reasons.append(f"read-after-write:{candidate.id}<-{tile.candidate_id}")
+                    if np.any(
+                        selected_changed[candidate.id][
+                            tile_region.y0 : tile_region.y1,
+                            tile_region.x0 : tile_region.x1,
+                        ]
+                    ):
+                        reasons.append(f"read-after-write:{tile.candidate_id}<-{candidate.id}")
+                if reasons:
+                    active_conflicts.append((tile, sorted(set(reasons))))
+        if active_conflicts and not replace:
+            details = "; ".join(
+                f"{tile.candidate_id}: {', '.join(reasons)}"
+                for tile, reasons in active_conflicts
             )
+            raise ValueError(
+                "candidate(s) conflict with adopted region(s); adopt with "
+                f"replace=True or cancel the conflict explicitly: {details}"
+            )
+
+        conflicting_active = {tile for tile, _ in active_conflicts}
         context = RenderContext(is_cancelled=is_cancelled, time=target.time)
         context.raise_if_cancelled()
         pixels = _read_png(
             self._published_path(target, current_version)
         ).copy()
-        tile_pixels = _read_png(candidate.tile_path)
-        pixels[
-            candidate.region.y0 : candidate.region.y1,
-            candidate.region.x0 : candidate.region.x1,
-        ] = tile_pixels
+        for candidate in selected:
+            pixels[
+                candidate.region.y0 : candidate.region.y1,
+                candidate.region.x0 : candidate.region.x1,
+            ] = selected_tiles[candidate.id]
 
         kept_tiles = [
             tile
             for tile in active
-            if not (replace and tile.region.intersects(candidate.region))
+            if tile not in conflicting_active
         ]
         tile_records: dict[str, dict] = {}
         for tile in kept_tiles:
             tile_records[tile.candidate_id] = tile.to_dict()
-        adopted_record = {
-            "candidate_id": candidate.id,
-            "region": candidate.region.as_list(),
-            "overrides": candidate.overrides,
-            "signature": candidate.signature,
-            "content_digest": candidate.content_digest,
-        }
-        tile_records[candidate.id] = adopted_record
+        for candidate in selected:
+            tile_records[candidate.id] = {
+                "candidate_id": candidate.id,
+                "region": candidate.region.as_list(),
+                "read_region": (candidate.read_region or candidate.region).as_list(),
+                "overrides": candidate.overrides,
+                "signature": candidate.signature,
+                "content_digest": candidate.content_digest,
+            }
 
         engine, signatures, _ = self._node_signatures(target, None)
         published_signature = self._partition_signature(
@@ -897,45 +1295,58 @@ class RegionWorkspace:
             tile_records,
             signatures,
         )
-        adopted_tile_path = self._adopted_tile_path(target, candidate.id)
-        _write_png(
-            tile_pixels,
-            adopted_tile_path,
-            {
-                "Region-Candidate": candidate.id,
-                "Region-Candidate-Signature": candidate.signature,
-                "Region-Candidate-Content-SHA256": candidate.content_digest,
-            },
-        )
-        adopted_tile = AdoptedTile(
-            candidate_id=candidate.id,
-            target=target,
-            region=candidate.region,
-            overrides=dict(candidate.overrides),
-            signature=candidate.signature,
-            content_digest=candidate.content_digest,
-            published_version=current_version + 1,
-            tile_path=adopted_tile_path,
-        )
-        self.adopted.append(adopted_tile)
+        adopted_tiles = []
+        for candidate in selected:
+            tile_pixels = selected_tiles[candidate.id]
+            adopted_tile_path = self._adopted_tile_path(target, candidate.id)
+            _write_png(
+                tile_pixels,
+                adopted_tile_path,
+                {
+                    "Region-Candidate": candidate.id,
+                    "Region-Candidate-Signature": candidate.signature,
+                    "Region-Candidate-Content-SHA256": candidate.content_digest,
+                },
+            )
+            adopted_tile = AdoptedTile(
+                candidate_id=candidate.id,
+                target=target,
+                region=candidate.region,
+                overrides=dict(candidate.overrides),
+                signature=candidate.signature,
+                content_digest=candidate.content_digest,
+                published_version=current_version + 1,
+                tile_path=adopted_tile_path,
+                read_region=candidate.read_region,
+            )
+            self.adopted.append(adopted_tile)
+            adopted_tiles.append(adopted_tile)
         if replace:
-            for tile in overlapping:
+            for tile, reasons in active_conflicts:
                 tile.valid = False
                 tile.reason = (
-                    f"replaced by candidate {candidate.id} at version {current_version + 1}"
+                    f"replaced by candidates {', '.join(selected_ids)} at version "
+                    f"{current_version + 1}: {', '.join(reasons)}"
                 )
         self.versions[target.key()] = current_version + 1
-        for path in (candidate.meta_path,):
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
-        try:
-            os.unlink(candidate.tile_path)
-        except FileNotFoundError:
-            pass
-        del self.candidates[candidate.id]
-        return adopted_tile
+        for candidate in selected:
+            for path in (candidate.meta_path, candidate.tile_path):
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+            del self.candidates[candidate.id]
+        return adopted_tiles
+
+    def adopt_candidate(
+        self,
+        candidate_id: str,
+        replace: bool = False,
+        is_cancelled: Callable[[], bool] = lambda: False,
+    ) -> AdoptedTile:
+        return self.adopt_candidate_combinations(
+            [candidate_id], replace=replace, is_cancelled=is_cancelled
+        )[0]
 
     def _partition_signature(
         self,
@@ -1347,6 +1758,7 @@ class RegionWorkspace:
                     target, tile.region, tile.overrides or {}, signatures
                 )
                 tile_path = self._adopted_tile_path(target, tile.candidate_id)
+                read_region = self._candidate_read_region(engine, target, tile.region)
                 _write_png(
                     new_pixels,
                     tile_path,
@@ -1365,6 +1777,7 @@ class RegionWorkspace:
                     content_digest=digest,
                     published_version=current_version + 1,
                     tile_path=tile_path,
+                    read_region=read_region,
                 )
                 new_tiles.append(new_tile)
             else:
